@@ -2,24 +2,29 @@
 Minimal Tkinter GUI for pwgen.
 
 Layout:
-  ┌─────────────────────────────────────────────┐
-  │  Constraints                                │
-  │  [Length] [Min] [Max] [Charset ▼]           │
-  │  [No-consecutive spec] [Max repeats]        │
-  │  [Min entropy] [☐ No keyboard walks]        │
-  │  [Mutations ▼]  [Output path ...]           │
-  │  [Preset ▼]                                 │
-  │                                             │
-  │  [Generate]         [Stop]                  │
-  │                                             │
-  │  Progress: ████████░░ 1,234,567 cands       │
-  │  Rate: 8.4M/s                               │
-  │                                             │
-  │  ╔═══════════ Log ═══════════╗              │
-  │  ║  [INFO] Compiling rules…  ║              │
-  │  ║  [INFO] Writing out.txt   ║              │
-  │  ╚═══════════════════════════╝              │
-  └─────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │  Constraints                                    │
+  │  [Length] [Min] [Max]  [Charset ▼]              │
+  │  [Custom chars]  [No-consec]  [Max repeats]     │
+  │  [Min entropy]  [☐ No walks]  [Req classes]     │
+  │  [Must not start]  [Must not end]  [Must start] │
+  │                                                 │
+  │  Hints (plain language)                         │
+  │  [multiline free-text hint box]                 │
+  │                                                 │
+  │  Output                                         │
+  │  [File ...]  [Format ▼]  [Mutations ▼]          │
+  │  [Preset ▼]  [Limit]                            │
+  │                                                 │
+  │  [Generate]         [Stop]                      │
+  │                                                 │
+  │  Progress: ████████░░ 1,234,567 cands           │
+  │                                                 │
+  │  ╔═════════════ Log ═════════════╗              │
+  │  ║  [INFO] Compiling rules…      ║              │
+  │  ║  [INFO] Writing out.txt       ║              │
+  │  ╚═══════════════════════════════╝              │
+  └─────────────────────────────────────────────────┘
 """
 from __future__ import annotations
 import os
@@ -159,6 +164,54 @@ class PwgenGUI:
                 bg=_BG, fg=_FG, selectcolor=_ENTRY_BG,
                 activebackground=_BG, font=_FONT,
             ).grid(row=2, column=5+i, padx=2, pady=4)
+
+        # Row 3: Position rules
+        tk.Label(cf, text="Must not start with", bg=_BG, fg=_FG, font=_FONT).grid(
+            row=3, column=0, sticky="e", padx=(8,2), pady=4)
+        self.must_not_start_var = tk.StringVar()
+        tk.Entry(cf, textvariable=self.must_not_start_var, width=14,
+                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
+                 ).grid(row=3, column=1, padx=4, pady=4)
+
+        tk.Label(cf, text="Must not end with", bg=_BG, fg=_FG, font=_FONT).grid(
+            row=3, column=2, sticky="e", padx=(12,2), pady=4)
+        self.must_not_end_var = tk.StringVar()
+        tk.Entry(cf, textvariable=self.must_not_end_var, width=14,
+                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
+                 ).grid(row=3, column=3, padx=4, pady=4)
+
+        tk.Label(cf, text="Must start with", bg=_BG, fg=_FG, font=_FONT).grid(
+            row=3, column=4, sticky="e", padx=(12,2), pady=4)
+        self.must_start_with_var = tk.StringVar()
+        tk.Entry(cf, textvariable=self.must_start_with_var, width=14,
+                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
+                 ).grid(row=3, column=5, padx=4, pady=4)
+
+        tk.Label(
+            cf,
+            text="(comma-separated values for all position fields)",
+            bg=_BG, fg="#6c7086", font=("Consolas", 8),
+        ).grid(row=3, column=6, columnspan=3, sticky="w", padx=4)
+
+        # ── Hints frame ──
+        hf = tk.LabelFrame(
+            self.root, text=" Hints (plain language) ", font=_FONT_H,
+            bg=_BG, fg=_ACCENT, bd=1, relief="groove",
+        )
+        hf.pack(fill="x", padx=10, pady=4)
+
+        tk.Label(
+            hf,
+            text='One hint per line, e.g:  "7 characters"  |  "starts with admin"  |  '
+                 '"no 3 zeros in a row"  |  "must have digit"  |  "no keyboard walk"',
+            bg=_BG, fg="#6c7086", font=("Consolas", 8),
+        ).pack(anchor="w", padx=6, pady=(4, 0))
+
+        self.hints_text = scrolledtext.ScrolledText(
+            hf, bg=_ENTRY_BG, fg=_FG, insertbackground=_FG,
+            font=_FONT, height=3, wrap="word",
+        )
+        self.hints_text.pack(fill="x", padx=6, pady=(2, 6))
 
         # ── Output frame ──
         of = tk.LabelFrame(
@@ -378,6 +431,40 @@ class PwgenGUI:
         if self.mutations_var.get() != "none":
             cfg["mutations"] = {"profile": self.mutations_var.get(), "max_expansion": 50}
 
+        # Position rules
+        pos_rules: dict = {}
+        if self.must_not_start_var.get().strip():
+            pos_rules["must_not_start_with"] = [
+                v.strip() for v in self.must_not_start_var.get().split(",") if v.strip()
+            ]
+        if self.must_not_end_var.get().strip():
+            pos_rules["must_not_end_with"] = [
+                v.strip() for v in self.must_not_end_var.get().split(",") if v.strip()
+            ]
+        if pos_rules:
+            cfg["position_rules"] = pos_rules
+
+        if self.must_start_with_var.get().strip():
+            cfg.setdefault("patterns", {})["startswith"] = [
+                v.strip() for v in self.must_start_with_var.get().split(",") if v.strip()
+            ]
+
+        # Hints — merge into cfg; explicit GUI fields take priority
+        hints_raw = self.hints_text.get("1.0", "end").strip()
+        if hints_raw:
+            hint_lines = [ln.strip() for ln in hints_raw.splitlines() if ln.strip()]
+            hint_cfg = parse_hints(hint_lines)
+            for key, val in hint_cfg.items():
+                if key not in cfg:
+                    cfg[key] = val
+                elif key == "patterns" and isinstance(val, dict):
+                    # Deep-merge patterns sub-dict
+                    for pkey, pval in val.items():
+                        cfg["patterns"].setdefault(pkey, pval)
+                elif key == "charset_options" and isinstance(val, dict):
+                    for okey, oval in val.items():
+                        cfg.setdefault("charset_options", {}).setdefault(okey, oval)
+
         limit = self.limit_var.get().strip()
         cfg["output"] = {
             "format": self.fmt_var.get(),
@@ -420,7 +507,9 @@ class PwgenGUI:
         if self._stop_flag.is_set():
             return
         rate_str = f"{rate/1_000_000:.1f}M" if rate >= 1_000_000 else f"{rate/1_000:.1f}K"
-        self._log_q.put(("INFO", f"  {written:,} candidates  ({rate_str}/sec)"))
+        # Only log milestones, not every tick — avoids log spam
+        if written > 0 and (written % 50_000 == 0 or rate > 0):
+            self._log_q.put(("INFO", f"  {written:,} candidates  ({rate_str}/sec)"))
         self.count_label.configure(text=f"{written:,} cands  {rate_str}/s")
 
     def _generate_thread(self, rules) -> None:
