@@ -1,32 +1,22 @@
 """
-Minimal Tkinter GUI for pwgen.
+pwgen GUI  —  dark / light theme · password history · position rules · hints.
 
-Layout:
-  ┌─────────────────────────────────────────────────┐
-  │  Constraints                                    │
-  │  [Length] [Min] [Max]  [Charset ▼]              │
-  │  [Custom chars]  [No-consec]  [Max repeats]     │
-  │  [Min entropy]  [☐ No walks]  [Req classes]     │
-  │  [Must not start]  [Must not end]  [Must start] │
-  │                                                 │
-  │  Hints (plain language)                         │
-  │  [multiline free-text hint box]                 │
-  │                                                 │
-  │  Output                                         │
-  │  [File ...]  [Format ▼]  [Mutations ▼]          │
-  │  [Preset ▼]  [Limit]                            │
-  │                                                 │
-  │  [Generate]         [Stop]                      │
-  │                                                 │
-  │  Progress: ████████░░ 1,234,567 cands           │
-  │                                                 │
-  │  ╔═════════════ Log ═════════════╗              │
-  │  ║  [INFO] Compiling rules…      ║              │
-  │  ║  [INFO] Writing out.txt       ║              │
-  │  ╚═══════════════════════════════╝              │
-  └─────────────────────────────────────────────────┘
+Layout
+------
+  Title bar ──────────────────────────────── [☀/☾ theme toggle]
+  ── separator ────────────────────────────────────────────────
+  Constraints  (length · charset · no-consec · entropy · pos rules)
+  Hints        (plain-language text box + Clear button)
+  Output       (file · format · mutations · preset · limit)
+  ── action bar: [▶ Generate]  [■ Stop]  live-stats ──────────
+  Progress bar
+  ┌── Notebook ──────────────────────────────────────────────┐
+  │  Tab "Log"      │  Tab "History"                         │
+  │  scrolled text  │  treeview  +  Reuse / Open / Clear     │
+  └──────────────────────────────────────────────────────────┘
 """
 from __future__ import annotations
+import datetime
 import os
 import queue
 import threading
@@ -35,308 +25,642 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .hint_parser import parse_hints
 from .rule_compiler import compile_rules, RuleConflictError, CHARSETS
-from .generator import generate
 from .pipeline import run_pipeline
 
 
-_CHARSETS   = list(CHARSETS.keys()) + ["custom"]
-_MUTATIONS  = ["none", "standard", "aggressive"]
-_PRESETS    = ["(none)", "numeric_7", "policy_enterprise", "ctf_binary"]
-_FORMATS    = ["txt", "csv", "json", "gz"]
-_BG         = "#1e1e2e"
-_FG         = "#cdd6f4"
-_ACCENT     = "#89b4fa"
-_BTN_RUN    = "#a6e3a1"
-_BTN_STOP   = "#f38ba8"
-_ENTRY_BG   = "#313244"
-_LOG_BG     = "#11111b"
-_FONT       = ("Consolas", 10)
-_FONT_H     = ("Consolas", 11, "bold")
+# ── UI constants ──────────────────────────────────────────────────────────────
 
+_CHARSETS  = list(CHARSETS.keys()) + ["custom"]
+_MUTATIONS = ["none", "standard", "aggressive"]
+_PRESETS   = ["(none)", "numeric_7", "policy_enterprise", "ctf_binary"]
+_FORMATS   = ["txt", "csv", "json", "gz"]
+_FONT      = ("Consolas", 10)
+_FONT_H    = ("Consolas", 11, "bold")
+_FONT_SM   = ("Consolas", 8)
+
+DARK: dict[str, str] = {
+    "bg":       "#1e1e2e",
+    "fg":       "#cdd6f4",
+    "accent":   "#89b4fa",
+    "btn_run":  "#a6e3a1",
+    "btn_stop": "#f38ba8",
+    "btn_fg":   "#1e1e2e",
+    "entry_bg": "#313244",
+    "log_bg":   "#11111b",
+    "muted":    "#6c7086",
+    "warn":     "#f9e2af",
+    "sel_bg":   "#45475a",
+}
+
+LIGHT: dict[str, str] = {
+    "bg":       "#eff1f5",
+    "fg":       "#4c4f69",
+    "accent":   "#1e66f5",
+    "btn_run":  "#40a02b",
+    "btn_stop": "#d20f39",
+    "btn_fg":   "#ffffff",
+    "entry_bg": "#dce0e8",
+    "log_bg":   "#cdd0da",
+    "muted":    "#9ca0b0",
+    "warn":     "#df8e1d",
+    "sel_bg":   "#bcc0cc",
+}
+
+
+# ── Tooltip ───────────────────────────────────────────────────────────────────
+
+class _Tip:
+    """Simple hover tooltip attached to any widget."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self._w    = widget
+        self._text = text
+        self._top: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _=None) -> None:
+        if self._top:
+            return
+        x = self._w.winfo_rootx() + 12
+        y = self._w.winfo_rooty() + self._w.winfo_height() + 4
+        self._top = top = tk.Toplevel(self._w)
+        top.wm_overrideredirect(True)
+        top.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            top, text=self._text, justify="left",
+            bg="#313244", fg="#cdd6f4",
+            font=("Consolas", 9), relief="flat",
+            padx=8, pady=5, wraplength=320,
+        ).pack()
+
+    def _hide(self, _=None) -> None:
+        if self._top:
+            self._top.destroy()
+            self._top = None
+
+
+# ── PwgenGUI ──────────────────────────────────────────────────────────────────
 
 class PwgenGUI:
+
+    # ── init ──────────────────────────────────────────────────────────────────
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("pwgen — Password List Generator")
-        self.root.configure(bg=_BG)
         self.root.resizable(True, True)
-        self.root.minsize(680, 600)
+        self.root.minsize(740, 720)
 
         self._stop_flag = threading.Event()
         self._log_q: queue.Queue = queue.Queue()
-        self._running = False
+        self._running   = False
+        self._dark_mode = True
+        self.t          = DARK.copy()
+        self._last_cfg: dict = {}
+
+        # History
+        self._history: list[dict] = []
+        self._hist_cfg: dict[str, dict] = {}   # treeview iid -> full cfg
+
+        # Theme registries (populated during _build_ui)
+        self._rframes:  list[tk.Frame]       = []
+        self._rlabels:  list[tuple]          = []   # (widget, fg_key)
+        self._rentries: list[tk.Entry]       = []
+        self._rchecks:  list[tk.Checkbutton] = []
+        self._rlframes: list[tk.LabelFrame]  = []
+        self._rbtns_n:  list[tk.Button]      = []   # neutral buttons
+        self._rtexts:   list[tk.Text]        = []   # scrolled-text bodies
 
         self._build_ui()
+        self._apply_ttk_style()
         self._poll_log()
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    # ── Theme registry shortcuts ──────────────────────────────────────────────
+
+    def _rl(self, w: tk.Label,       fg: str = "fg")  -> tk.Label:
+        self._rlabels.append((w, fg)); return w
+
+    def _rf(self, w: tk.Frame)                         -> tk.Frame:
+        self._rframes.append(w); return w
+
+    def _re(self, w: tk.Entry)                         -> tk.Entry:
+        self._rentries.append(w); return w
+
+    def _rc(self, w: tk.Checkbutton)                   -> tk.Checkbutton:
+        self._rchecks.append(w); return w
+
+    def _rlf(self, w: tk.LabelFrame)                   -> tk.LabelFrame:
+        self._rlframes.append(w); return w
+
+    def _rbn(self, w: tk.Button)                       -> tk.Button:
+        self._rbtns_n.append(w); return w
+
+    def _rt(self, w: tk.Text)                          -> tk.Text:
+        self._rtexts.append(w); return w
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        pad = dict(padx=8, pady=4)
+        t = self.t
 
         # ── Title bar ──
-        tk.Label(
-            self.root, text="pwgen  •  Password Candidate Generator",
-            font=("Consolas", 13, "bold"), bg=_BG, fg=_ACCENT,
-        ).pack(fill="x", **pad)
-        tk.Label(
-            self.root,
-            text="FOR AUTHORIZED SECURITY TESTING ONLY",
-            font=("Consolas", 9), bg=_BG, fg=_BTN_STOP,
-        ).pack(fill="x", padx=8)
+        top = self._rf(tk.Frame(self.root, bg=t["bg"]))
+        top.pack(fill="x", padx=10, pady=(8, 2))
+
+        self._rl(tk.Label(
+            top, text="pwgen  •  Password Candidate Generator",
+            font=("Consolas", 13, "bold"), bg=t["bg"], fg=t["accent"],
+        ), "accent").pack(side="left")
+
+        self.theme_btn = tk.Button(
+            top, text="☀  Light mode", command=self._toggle_theme,
+            bg=t["entry_bg"], fg=t["fg"], font=_FONT,
+            relief="flat", padx=10, pady=3,
+            activebackground=t["accent"], activeforeground=t["bg"],
+            cursor="hand2",
+        )
+        self.theme_btn.pack(side="right")
+        self._rbn(self.theme_btn)
+
+        self._rl(tk.Label(
+            self.root, text="FOR AUTHORIZED SECURITY TESTING ONLY",
+            font=_FONT_SM, bg=t["bg"], fg=t["btn_stop"],
+        ), "btn_stop").pack(fill="x", padx=10)
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", pady=6)
 
         # ── Constraints frame ──
-        cf = tk.LabelFrame(
+        cf = self._rlf(tk.LabelFrame(
             self.root, text=" Constraints ", font=_FONT_H,
-            bg=_BG, fg=_ACCENT, bd=1, relief="groove",
-        )
+            bg=t["bg"], fg=t["accent"], bd=1, relief="groove",
+        ))
         cf.pack(fill="x", padx=10, pady=4)
 
-        # Row 0: Length / Min / Max / Charset
+        # Row 0 — Length / Min / Max / Charset
         self._add_row(cf, 0, [
-            ("Length (exact)", "length_var", ""),
-            ("Min length",     "min_var",    "1"),
-            ("Max length",     "max_var",    "16"),
+            ("Length (exact)", "length_var", "",   "Exact length overrides Min/Max. Leave blank to use range."),
+            ("Min length",     "min_var",    "1",  "Minimum password length (inclusive)."),
+            ("Max length",     "max_var",    "16", "Maximum password length (inclusive)."),
         ])
-        tk.Label(cf, text="Charset", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=0, column=6, sticky="e", padx=(12, 2), pady=4)
+        self._rl(tk.Label(cf, text="Charset", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=0, column=6, sticky="e", padx=(12, 2), pady=4)
         self.charset_var = tk.StringVar(value="digits")
         ttk.Combobox(
             cf, textvariable=self.charset_var, values=_CHARSETS,
             state="readonly", width=12, font=_FONT,
         ).grid(row=0, column=7, padx=4, pady=4)
 
-        # Row 1: Custom chars / No-consecutive / Max repeats
-        tk.Label(cf, text="Custom chars", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=1, column=0, sticky="e", padx=(8,2), pady=4)
+        # Row 1 — Custom chars / No-consecutive / Max repeats
+        self._rl(tk.Label(cf, text="Custom chars", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=1, column=0, sticky="e", padx=(8, 2), pady=4)
         self.custom_chars_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self.custom_chars_var, width=14,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=1, column=1, padx=4, pady=4)
+        self._re(tk.Entry(cf, textvariable=self.custom_chars_var, width=14,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT)
+             ).grid(row=1, column=1, padx=4, pady=4)
 
-        tk.Label(cf, text="No-consec (char:n)", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=1, column=2, sticky="e", padx=(12,2), pady=4)
+        self._rl(tk.Label(cf, text="No-consec (char:n)", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=1, column=2, sticky="e", padx=(12, 2), pady=4)
         self.no_consec_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self.no_consec_var, width=10,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=1, column=3, padx=4, pady=4)
+        nc_e = self._re(tk.Entry(cf, textvariable=self.no_consec_var, width=10,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
+        nc_e.grid(row=1, column=3, padx=4, pady=4)
+        _Tip(nc_e, 'e.g. "0:3" = no more than 3 zeros in a row.\n"any:3" applies to every character.')
 
-        tk.Label(cf, text="Max repeats", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=1, column=4, sticky="e", padx=(12,2), pady=4)
+        self._rl(tk.Label(cf, text="Max repeats", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=1, column=4, sticky="e", padx=(12, 2), pady=4)
         self.max_repeats_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self.max_repeats_var, width=6,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=1, column=5, padx=4, pady=4)
+        mr_e = self._re(tk.Entry(cf, textvariable=self.max_repeats_var, width=6,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
+        mr_e.grid(row=1, column=5, padx=4, pady=4)
+        _Tip(mr_e, "Max times any single digit may appear in the password.")
 
-        # Row 2: Entropy / keyboard walks / require classes
-        tk.Label(cf, text="Min entropy (bits)", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=2, column=0, sticky="e", padx=(8,2), pady=4)
+        # Row 2 — Entropy / Keyboard walks / Require classes
+        self._rl(tk.Label(cf, text="Min entropy (bits)", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=2, column=0, sticky="e", padx=(8, 2), pady=4)
         self.entropy_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self.entropy_var, width=8,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=2, column=1, padx=4, pady=4)
+        ent_e = self._re(tk.Entry(cf, textvariable=self.entropy_var, width=8,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
+        ent_e.grid(row=2, column=1, padx=4, pady=4)
+        _Tip(ent_e, "Shannon entropy in bits.\n30+ moderate  |  50+ strong  |  70+ very strong")
 
         self.no_walks_var = tk.BooleanVar()
-        tk.Checkbutton(
+        self._rc(tk.Checkbutton(
             cf, text="No keyboard walks", variable=self.no_walks_var,
-            bg=_BG, fg=_FG, selectcolor=_ENTRY_BG, activebackground=_BG,
-            font=_FONT,
-        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=12, pady=4)
+            bg=t["bg"], fg=t["fg"], selectcolor=t["entry_bg"],
+            activebackground=t["bg"], font=_FONT,
+        )).grid(row=2, column=2, columnspan=2, sticky="w", padx=12, pady=4)
 
-        tk.Label(cf, text="Require classes", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=2, column=4, sticky="e", padx=(12,2))
+        self._rl(tk.Label(cf, text="Require classes", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=2, column=4, sticky="e", padx=(12, 2))
         self.req_upper_var  = tk.BooleanVar()
         self.req_lower_var  = tk.BooleanVar()
         self.req_digit_var  = tk.BooleanVar()
         self.req_symbol_var = tk.BooleanVar()
-        for i, (label, var) in enumerate([
+        for i, (lbl, var) in enumerate([
             ("upper",  self.req_upper_var),
             ("lower",  self.req_lower_var),
             ("digit",  self.req_digit_var),
             ("symbol", self.req_symbol_var),
         ]):
-            tk.Checkbutton(
-                cf, text=label, variable=var,
-                bg=_BG, fg=_FG, selectcolor=_ENTRY_BG,
-                activebackground=_BG, font=_FONT,
-            ).grid(row=2, column=5+i, padx=2, pady=4)
+            self._rc(tk.Checkbutton(
+                cf, text=lbl, variable=var,
+                bg=t["bg"], fg=t["fg"], selectcolor=t["entry_bg"],
+                activebackground=t["bg"], font=_FONT,
+            )).grid(row=2, column=5+i, padx=2, pady=4)
 
-        # Row 3: Position rules
-        tk.Label(cf, text="Must not start with", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=3, column=0, sticky="e", padx=(8,2), pady=4)
+        # Row 3 — Position rules
+        self._rl(tk.Label(cf, text="Must not start with", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=3, column=0, sticky="e", padx=(8, 2), pady=4)
         self.must_not_start_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self.must_not_start_var, width=14,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=3, column=1, padx=4, pady=4)
+        mns_e = self._re(tk.Entry(cf, textvariable=self.must_not_start_var, width=14,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
+        mns_e.grid(row=3, column=1, padx=4, pady=4)
+        _Tip(mns_e, "Comma-separated values.\ne.g. '0,1' rejects passwords that start with 0 or 1.")
 
-        tk.Label(cf, text="Must not end with", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=3, column=2, sticky="e", padx=(12,2), pady=4)
+        self._rl(tk.Label(cf, text="Must not end with", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=3, column=2, sticky="e", padx=(12, 2), pady=4)
         self.must_not_end_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self.must_not_end_var, width=14,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=3, column=3, padx=4, pady=4)
+        mne_e = self._re(tk.Entry(cf, textvariable=self.must_not_end_var, width=14,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
+        mne_e.grid(row=3, column=3, padx=4, pady=4)
+        _Tip(mne_e, "Comma-separated values.\ne.g. '000,111' rejects passwords ending with 000 or 111.")
 
-        tk.Label(cf, text="Must start with", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=3, column=4, sticky="e", padx=(12,2), pady=4)
+        self._rl(tk.Label(cf, text="Must start with", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=3, column=4, sticky="e", padx=(12, 2), pady=4)
         self.must_start_with_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self.must_start_with_var, width=14,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=3, column=5, padx=4, pady=4)
+        msw_e = self._re(tk.Entry(cf, textvariable=self.must_start_with_var, width=14,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
+        msw_e.grid(row=3, column=5, padx=4, pady=4)
+        _Tip(msw_e, "Comma-separated prefixes.\ne.g. 'admin,root' keeps only passwords starting with those strings.")
 
-        tk.Label(
-            cf,
-            text="(comma-separated values for all position fields)",
-            bg=_BG, fg="#6c7086", font=("Consolas", 8),
-        ).grid(row=3, column=6, columnspan=3, sticky="w", padx=4)
+        self._rl(tk.Label(
+            cf, text="(comma-separated for all position fields)",
+            bg=t["bg"], fg=t["muted"], font=_FONT_SM,
+        ), "muted").grid(row=3, column=6, columnspan=3, sticky="w", padx=4)
 
         # ── Hints frame ──
-        hf = tk.LabelFrame(
+        hf = self._rlf(tk.LabelFrame(
             self.root, text=" Hints (plain language) ", font=_FONT_H,
-            bg=_BG, fg=_ACCENT, bd=1, relief="groove",
-        )
+            bg=t["bg"], fg=t["accent"], bd=1, relief="groove",
+        ))
         hf.pack(fill="x", padx=10, pady=4)
 
-        tk.Label(
-            hf,
-            text='One hint per line, e.g:  "7 characters"  |  "starts with admin"  |  '
-                 '"no 3 zeros in a row"  |  "must have digit"  |  "no keyboard walk"',
-            bg=_BG, fg="#6c7086", font=("Consolas", 8),
-        ).pack(anchor="w", padx=6, pady=(4, 0))
+        hint_hdr = self._rf(tk.Frame(hf, bg=t["bg"]))
+        hint_hdr.pack(fill="x", padx=6, pady=(4, 0))
+        self._rl(tk.Label(
+            hint_hdr,
+            text='One per line — e.g.  "7 characters"  •  "starts with admin"  •  '
+                 '"no 3 zeros in a row"  •  "must have digit"  •  "no keyboard walk"',
+            bg=t["bg"], fg=t["muted"], font=_FONT_SM,
+        ), "muted").pack(side="left")
+        self._rbn(tk.Button(
+            hint_hdr, text="Clear hints", command=self._clear_hints,
+            bg=t["entry_bg"], fg=t["fg"], font=_FONT_SM,
+            relief="flat", padx=6, pady=2, cursor="hand2",
+            activebackground=t["accent"], activeforeground=t["bg"],
+        )).pack(side="right")
 
         self.hints_text = scrolledtext.ScrolledText(
-            hf, bg=_ENTRY_BG, fg=_FG, insertbackground=_FG,
+            hf, bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"],
             font=_FONT, height=3, wrap="word",
         )
         self.hints_text.pack(fill="x", padx=6, pady=(2, 6))
+        self._rt(self.hints_text)
 
         # ── Output frame ──
-        of = tk.LabelFrame(
+        of = self._rlf(tk.LabelFrame(
             self.root, text=" Output ", font=_FONT_H,
-            bg=_BG, fg=_ACCENT, bd=1, relief="groove",
-        )
+            bg=t["bg"], fg=t["accent"], bd=1, relief="groove",
+        ))
         of.pack(fill="x", padx=10, pady=4)
 
-        tk.Label(of, text="File", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=0, column=0, sticky="e", padx=(8,2), pady=4)
+        self._rl(tk.Label(of, text="File", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=0, column=0, sticky="e", padx=(8, 2), pady=4)
         self.output_var = tk.StringVar(value="wordlist.txt")
-        tk.Entry(of, textvariable=self.output_var, width=36,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=0, column=1, padx=4, pady=4)
-        tk.Button(
+        self._re(tk.Entry(of, textvariable=self.output_var, width=36,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT)
+             ).grid(row=0, column=1, padx=4, pady=4)
+        self._rbn(tk.Button(
             of, text="Browse…", command=self._browse_output,
-            bg=_ENTRY_BG, fg=_FG, activebackground=_ACCENT, font=_FONT,
-        ).grid(row=0, column=2, padx=4, pady=4)
+            bg=t["entry_bg"], fg=t["fg"], font=_FONT,
+            activebackground=t["accent"], activeforeground=t["bg"],
+        )).grid(row=0, column=2, padx=4, pady=4)
 
-        tk.Label(of, text="Format", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=0, column=3, sticky="e", padx=(12,2))
+        self._rl(tk.Label(of, text="Format", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=0, column=3, sticky="e", padx=(12, 2))
         self.fmt_var = tk.StringVar(value="txt")
         ttk.Combobox(
             of, textvariable=self.fmt_var, values=_FORMATS,
             state="readonly", width=6, font=_FONT,
         ).grid(row=0, column=4, padx=4, pady=4)
 
-        tk.Label(of, text="Mutations", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=0, column=5, sticky="e", padx=(12,2))
+        self._rl(tk.Label(of, text="Mutations", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=0, column=5, sticky="e", padx=(12, 2))
         self.mutations_var = tk.StringVar(value="none")
         ttk.Combobox(
             of, textvariable=self.mutations_var, values=_MUTATIONS,
             state="readonly", width=12, font=_FONT,
         ).grid(row=0, column=6, padx=4, pady=4)
 
-        tk.Label(of, text="Preset", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=1, column=0, sticky="e", padx=(8,2), pady=4)
+        self._rl(tk.Label(of, text="Preset", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=1, column=0, sticky="e", padx=(8, 2), pady=4)
         self.preset_var = tk.StringVar(value="(none)")
         ttk.Combobox(
             of, textvariable=self.preset_var, values=_PRESETS,
             state="readonly", width=18, font=_FONT,
         ).grid(row=1, column=1, padx=4, pady=4)
-        tk.Button(
+        self._rbn(tk.Button(
             of, text="Load preset", command=self._load_preset,
-            bg=_ENTRY_BG, fg=_FG, activebackground=_ACCENT, font=_FONT,
-        ).grid(row=1, column=2, padx=4, pady=4)
+            bg=t["entry_bg"], fg=t["fg"], font=_FONT,
+            activebackground=t["accent"], activeforeground=t["bg"],
+        )).grid(row=1, column=2, padx=4, pady=4)
 
+        self._rl(tk.Label(of, text="Limit candidates", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=1, column=3, sticky="e", padx=(12, 2))
         self.limit_var = tk.StringVar()
-        tk.Label(of, text="Limit candidates", bg=_BG, fg=_FG, font=_FONT).grid(
-            row=1, column=3, sticky="e", padx=(12,2))
-        tk.Entry(of, textvariable=self.limit_var, width=12,
-                 bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT
-                 ).grid(row=1, column=4, padx=4, pady=4)
+        lim_e = self._re(tk.Entry(of, textvariable=self.limit_var, width=12,
+                 bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
+        lim_e.grid(row=1, column=4, padx=4, pady=4)
+        _Tip(lim_e, "Stop after writing this many candidates. Leave blank for unlimited.")
 
         # ── Action buttons ──
-        bf = tk.Frame(self.root, bg=_BG)
+        bf = self._rf(tk.Frame(self.root, bg=t["bg"]))
         bf.pack(fill="x", padx=10, pady=6)
 
         self.run_btn = tk.Button(
             bf, text="▶  Generate", command=self._start_generation,
-            bg=_BTN_RUN, fg="#1e1e2e", activebackground="#a6e3a1",
+            bg=t["btn_run"], fg=t["btn_fg"], activebackground=t["btn_run"],
             font=("Consolas", 11, "bold"), width=16,
         )
         self.run_btn.pack(side="left", padx=(0, 8))
 
         self.stop_btn = tk.Button(
             bf, text="■  Stop", command=self._stop_generation,
-            bg=_BTN_STOP, fg="#1e1e2e", activebackground="#f38ba8",
+            bg=t["btn_stop"], fg=t["btn_fg"], activebackground=t["btn_stop"],
             font=("Consolas", 11, "bold"), width=10, state="disabled",
         )
         self.stop_btn.pack(side="left", padx=(0, 20))
 
-        self.stats_label = tk.Label(
-            bf, text="", bg=_BG, fg=_ACCENT, font=_FONT,
+        self.stats_label = self._rl(
+            tk.Label(bf, text="", bg=t["bg"], fg=t["accent"], font=_FONT), "accent"
         )
         self.stats_label.pack(side="left", fill="x", expand=True)
 
         # ── Progress bar ──
-        pf = tk.Frame(self.root, bg=_BG)
+        pf = self._rf(tk.Frame(self.root, bg=t["bg"]))
         pf.pack(fill="x", padx=10, pady=2)
         self.progress_var = tk.IntVar()
         self.progress_bar = ttk.Progressbar(
-            pf, variable=self.progress_var, mode="indeterminate", length=400,
+            pf, variable=self.progress_var, mode="indeterminate",
         )
         self.progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.count_label = tk.Label(pf, text="", bg=_BG, fg=_FG, font=_FONT, width=30)
+        self.count_label = self._rl(
+            tk.Label(pf, text="", bg=t["bg"], fg=t["fg"], font=_FONT, width=34)
+        )
         self.count_label.pack(side="left")
 
-        # ── Log ──
-        lf = tk.LabelFrame(
-            self.root, text=" Log ", font=_FONT_H,
-            bg=_BG, fg=_ACCENT, bd=1, relief="groove",
-        )
-        lf.pack(fill="both", expand=True, padx=10, pady=6)
+        # ── Notebook: Log | History ──
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+
+        # Tab 1 — Log
+        log_tab = self._rf(tk.Frame(self.nb, bg=t["bg"]))
+        self.nb.add(log_tab, text="  Log  ")
+
         self.log_box = scrolledtext.ScrolledText(
-            lf, bg=_LOG_BG, fg=_FG, font=_FONT,
-            state="disabled", wrap="word", height=12,
+            log_tab, bg=t["log_bg"], fg=t["fg"], font=_FONT,
+            state="disabled", wrap="word", height=10,
         )
         self.log_box.pack(fill="both", expand=True, padx=4, pady=4)
-        self.log_box.tag_config("INFO",    foreground=_FG)
-        self.log_box.tag_config("OK",      foreground=_BTN_RUN)
-        self.log_box.tag_config("WARN",    foreground="#f9e2af")
-        self.log_box.tag_config("ERROR",   foreground=_BTN_STOP)
-        self.log_box.tag_config("HEADING", foreground=_ACCENT)
+        self._rt(self.log_box)
+        self._refresh_log_tags()
 
-    def _add_row(self, parent, row, fields):
-        for col_offset, (label, attr, default) in enumerate(fields):
-            tk.Label(parent, text=label, bg=_BG, fg=_FG, font=_FONT).grid(
-                row=row, column=col_offset * 2, sticky="e", padx=(8 if col_offset == 0 else 12, 2), pady=4)
+        # Tab 2 — History
+        hist_tab = self._rf(tk.Frame(self.nb, bg=t["bg"]))
+        self.nb.add(hist_tab, text="  History  ")
+        self._build_history_tab(hist_tab)
+
+    # ── History tab ───────────────────────────────────────────────────────────
+
+    def _build_history_tab(self, parent: tk.Frame) -> None:
+        t = self.t
+
+        self._rl(tk.Label(
+            parent,
+            text="Previously generated password lists — select a row to reuse its settings.",
+            bg=t["bg"], fg=t["muted"], font=_FONT_SM,
+        ), "muted").pack(anchor="w", padx=6, pady=(6, 2))
+
+        # Treeview + scrollbars
+        tree_frame = self._rf(tk.Frame(parent, bg=t["bg"]))
+        tree_frame.pack(fill="both", expand=True, padx=6, pady=2)
+
+        cols = ("ts", "candidates", "file", "charset", "length")
+        self.hist_tree = ttk.Treeview(
+            tree_frame, columns=cols, show="headings",
+            selectmode="browse", height=8,
+        )
+        for col, heading, width, anchor in [
+            ("ts",         "Timestamp",   158, "w"),
+            ("candidates", "Candidates",  100, "e"),
+            ("file",       "Output File", 210, "w"),
+            ("charset",    "Charset",      80, "w"),
+            ("length",     "Length",       70, "w"),
+        ]:
+            self.hist_tree.heading(col, text=heading)
+            self.hist_tree.column(col, width=width, anchor=anchor, stretch=(col == "file"))
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=self.hist_tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.hist_tree.xview)
+        self.hist_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.hist_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self.hist_tree.bind("<<TreeviewSelect>>", self._on_hist_select)
+
+        # Empty-state label (hidden once entries exist)
+        self.hist_empty = self._rl(tk.Label(
+            parent,
+            text="No history yet — run a generation to record it here.",
+            bg=t["bg"], fg=t["muted"], font=_FONT,
+        ), "muted")
+        self.hist_empty.pack(pady=6)
+
+        # Action buttons
+        btn_row = self._rf(tk.Frame(parent, bg=t["bg"]))
+        btn_row.pack(fill="x", padx=6, pady=(2, 8))
+
+        self.hist_reuse_btn = self._rbn(tk.Button(
+            btn_row, text="↩  Reuse Settings", command=self._reuse_history,
+            bg=t["entry_bg"], fg=t["fg"], font=_FONT,
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            activebackground=t["accent"], activeforeground=t["bg"],
+            state="disabled",
+        ))
+        self.hist_reuse_btn.pack(side="left", padx=(0, 6))
+        _Tip(self.hist_reuse_btn, "Load the selected run's settings back into the form.")
+
+        self.hist_open_btn = self._rbn(tk.Button(
+            btn_row, text="Open File", command=self._open_hist_file,
+            bg=t["entry_bg"], fg=t["fg"], font=_FONT,
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            activebackground=t["accent"], activeforeground=t["bg"],
+            state="disabled",
+        ))
+        self.hist_open_btn.pack(side="left", padx=(0, 6))
+
+        self.hist_clear_btn = tk.Button(
+            btn_row, text="Clear History", command=self._clear_history,
+            bg=t["entry_bg"], fg=t["btn_stop"], font=_FONT,
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            activebackground=t["btn_stop"], activeforeground=t["btn_fg"],
+        )
+        self.hist_clear_btn.pack(side="right")
+
+    # ── Theme ─────────────────────────────────────────────────────────────────
+
+    def _toggle_theme(self) -> None:
+        self._dark_mode = not self._dark_mode
+        self.t = DARK.copy() if self._dark_mode else LIGHT.copy()
+        self._apply_theme()
+        self._apply_ttk_style()
+        self.theme_btn.configure(
+            text="☀  Light mode" if self._dark_mode else "☾  Dark mode"
+        )
+
+    def _apply_theme(self) -> None:
+        t = self.t
+        self.root.configure(bg=t["bg"])
+
+        for w in self._rframes:
+            try: w.configure(bg=t["bg"])
+            except tk.TclError: pass
+
+        for w, fg_key in self._rlabels:
+            try: w.configure(bg=t["bg"], fg=t[fg_key])
+            except tk.TclError: pass
+
+        for w in self._rentries:
+            try: w.configure(bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"])
+            except tk.TclError: pass
+
+        for w in self._rchecks:
+            try: w.configure(bg=t["bg"], fg=t["fg"],
+                              selectcolor=t["entry_bg"], activebackground=t["bg"])
+            except tk.TclError: pass
+
+        for w in self._rlframes:
+            try: w.configure(bg=t["bg"], fg=t["accent"])
+            except tk.TclError: pass
+
+        for w in self._rbtns_n:
+            try: w.configure(bg=t["entry_bg"], fg=t["fg"],
+                              activebackground=t["accent"], activeforeground=t["bg"])
+            except tk.TclError: pass
+
+        for w in self._rtexts:
+            bg = t["log_bg"] if w is self.log_box else t["entry_bg"]
+            try: w.configure(bg=bg, fg=t["fg"], insertbackground=t["fg"])
+            except tk.TclError: pass
+
+        # Named widgets not in registries
+        for btn, fg_key in [
+            (self.run_btn,  "btn_run"),
+            (self.stop_btn, "btn_stop"),
+        ]:
+            try: btn.configure(bg=t[fg_key], fg=t["btn_fg"], activebackground=t[fg_key])
+            except (tk.TclError, AttributeError): pass
+
+        try:
+            self.hist_clear_btn.configure(
+                bg=t["entry_bg"], fg=t["btn_stop"],
+                activebackground=t["btn_stop"], activeforeground=t["btn_fg"],
+            )
+        except (tk.TclError, AttributeError): pass
+
+        self._refresh_log_tags()
+
+    def _refresh_log_tags(self) -> None:
+        t = self.t
+        try:
+            self.log_box.tag_config("INFO",    foreground=t["fg"])
+            self.log_box.tag_config("OK",      foreground=t["btn_run"])
+            self.log_box.tag_config("WARN",    foreground=t["warn"])
+            self.log_box.tag_config("ERROR",   foreground=t["btn_stop"])
+            self.log_box.tag_config("HEADING", foreground=t["accent"])
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _apply_ttk_style(self) -> None:
+        t = self.t
+        s = ttk.Style(self.root)
+        s.theme_use("clam")
+
+        s.configure("TCombobox",
+                    fieldbackground=t["entry_bg"], background=t["entry_bg"],
+                    foreground=t["fg"], selectbackground=t["sel_bg"],
+                    selectforeground=t["fg"])
+        s.map("TCombobox",
+              fieldbackground=[("readonly", t["entry_bg"])],
+              foreground=[("readonly", t["fg"])])
+
+        s.configure("Horizontal.TProgressbar",
+                    troughcolor=t["entry_bg"], background=t["accent"], thickness=14)
+
+        s.configure("TSeparator", background=t["muted"])
+
+        s.configure("TNotebook", background=t["bg"], tabmargins=[2, 4, 2, 0])
+        s.configure("TNotebook.Tab", background=t["entry_bg"], foreground=t["fg"],
+                    padding=[12, 4], font=_FONT)
+        s.map("TNotebook.Tab",
+              background=[("selected", t["bg"]), ("active", t["sel_bg"])],
+              foreground=[("selected", t["accent"])])
+
+        s.configure("Treeview",
+                    background=t["entry_bg"], foreground=t["fg"],
+                    fieldbackground=t["entry_bg"], rowheight=24, font=_FONT)
+        s.configure("Treeview.Heading",
+                    background=t["bg"], foreground=t["accent"],
+                    font=("Consolas", 10, "bold"))
+        s.map("Treeview",
+              background=[("selected", t["sel_bg"])],
+              foreground=[("selected", t["fg"])])
+
+        s.configure("TScrollbar",
+                    background=t["entry_bg"], troughcolor=t["bg"],
+                    arrowcolor=t["fg"])
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _add_row(self, parent: tk.Frame, row: int, fields: list) -> None:
+        """Add a row of (label, StringVar-attr, default, tooltip) tuples."""
+        t = self.t
+        for col_offset, item in enumerate(fields):
+            label, attr, default = item[0], item[1], item[2]
+            tip = item[3] if len(item) > 3 else ""
+            lbl = tk.Label(parent, text=label, bg=t["bg"], fg=t["fg"], font=_FONT)
+            lbl.grid(row=row, column=col_offset*2,
+                     sticky="e", padx=(8 if col_offset == 0 else 12, 2), pady=4)
+            self._rl(lbl)
             var = tk.StringVar(value=default)
             setattr(self, attr, var)
-            tk.Entry(
+            ent = tk.Entry(
                 parent, textvariable=var, width=6,
-                bg=_ENTRY_BG, fg=_FG, insertbackground=_FG, font=_FONT,
-            ).grid(row=row, column=col_offset * 2 + 1, padx=4, pady=4)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+                bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT,
+            )
+            ent.grid(row=row, column=col_offset*2+1, padx=4, pady=4)
+            self._re(ent)
+            if tip:
+                _Tip(ent, tip)
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         self._log_q.put((level, msg))
 
     def _poll_log(self) -> None:
-        """Drain the log queue into the ScrolledText widget."""
         while not self._log_q.empty():
             level, msg = self._log_q.get_nowait()
             self.log_box.configure(state="normal")
@@ -344,6 +668,9 @@ class PwgenGUI:
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
         self.root.after(100, self._poll_log)
+
+    def _clear_hints(self) -> None:
+        self.hints_text.delete("1.0", "end")
 
     def _browse_output(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -365,27 +692,10 @@ class PwgenGUI:
             self._log(f"Preset file not found: {preset_path}", "WARN")
             return
         cfg = json.loads(preset_path.read_text())
-        # Apply preset values to UI fields
-        if "length" in cfg:
-            self.length_var.set(str(cfg["length"]))
-        if "charset" in cfg:
-            self.charset_var.set(cfg["charset"])
-        if "no_consecutive" in cfg and cfg["no_consecutive"]:
-            nc = cfg["no_consecutive"][0]
-            self.no_consec_var.set(f"{nc['char']}:{nc['count']}")
-        if "max_repeats" in cfg and cfg["max_repeats"].get("digits"):
-            self.max_repeats_var.set(str(cfg["max_repeats"]["digits"]))
-        if "output" in cfg:
-            out = cfg["output"]
-            if "path" in out:
-                self.output_var.set(out["path"])
-            if "format" in out:
-                self.fmt_var.set(out["format"])
+        self._apply_cfg_to_form(cfg)
         self._log(f"Preset '{preset}' loaded.", "OK")
 
-    # ------------------------------------------------------------------
-    # Generation
-    # ------------------------------------------------------------------
+    # ── Config ────────────────────────────────────────────────────────────────
 
     def _build_cfg(self) -> dict:
         cfg: dict = {}
@@ -431,7 +741,6 @@ class PwgenGUI:
         if self.mutations_var.get() != "none":
             cfg["mutations"] = {"profile": self.mutations_var.get(), "max_expansion": 50}
 
-        # Position rules
         pos_rules: dict = {}
         if self.must_not_start_var.get().strip():
             pos_rules["must_not_start_with"] = [
@@ -449,21 +758,20 @@ class PwgenGUI:
                 v.strip() for v in self.must_start_with_var.get().split(",") if v.strip()
             ]
 
-        # Hints — merge into cfg; explicit GUI fields take priority
+        # Hints — merge; explicit GUI fields take priority
         hints_raw = self.hints_text.get("1.0", "end").strip()
         if hints_raw:
             hint_lines = [ln.strip() for ln in hints_raw.splitlines() if ln.strip()]
-            hint_cfg = parse_hints(hint_lines)
+            hint_cfg   = parse_hints(hint_lines)
             for key, val in hint_cfg.items():
                 if key not in cfg:
                     cfg[key] = val
                 elif key == "patterns" and isinstance(val, dict):
-                    # Deep-merge patterns sub-dict
-                    for pkey, pval in val.items():
-                        cfg["patterns"].setdefault(pkey, pval)
+                    for pk, pv in val.items():
+                        cfg["patterns"].setdefault(pk, pv)
                 elif key == "charset_options" and isinstance(val, dict):
-                    for okey, oval in val.items():
-                        cfg.setdefault("charset_options", {}).setdefault(okey, oval)
+                    for ok, ov in val.items():
+                        cfg.setdefault("charset_options", {}).setdefault(ok, ov)
 
         limit = self.limit_var.get().strip()
         cfg["output"] = {
@@ -473,8 +781,62 @@ class PwgenGUI:
             "sort_by": "none",
             **({"max_candidates": int(limit)} if limit else {}),
         }
-
         return cfg
+
+    def _apply_cfg_to_form(self, cfg: dict) -> None:
+        """Populate all form fields from a cfg dict (preset load + history reuse)."""
+        cs = cfg.get("charset", "digits")
+        if cs in _CHARSETS:
+            self.charset_var.set(cs)
+        self.custom_chars_var.set(cfg.get("custom_chars", ""))
+
+        if "length" in cfg:
+            self.length_var.set(str(cfg["length"]))
+            self.min_var.set("")
+            self.max_var.set("")
+        else:
+            self.length_var.set("")
+            self.min_var.set(str(cfg.get("min_length", "1")))
+            self.max_var.set(str(cfg.get("max_length", "16")))
+
+        nc_list = cfg.get("no_consecutive", [])
+        if nc_list:
+            nc = nc_list[0]
+            self.no_consec_var.set(f"{nc['char']}:{nc['count']}")
+        else:
+            self.no_consec_var.set("")
+
+        mr = cfg.get("max_repeats", {})
+        self.max_repeats_var.set(str(mr.get("digits", "")) if mr else "")
+
+        ent = cfg.get("entropy", {})
+        self.entropy_var.set(str(ent.get("min_bits", "")) if ent else "")
+        self.no_walks_var.set(bool(cfg.get("keyboard_walk")))
+
+        rc = cfg.get("charset_options", {}).get("require_classes", [])
+        self.req_upper_var.set("upper"  in rc)
+        self.req_lower_var.set("lower"  in rc)
+        self.req_digit_var.set("digit"  in rc)
+        self.req_symbol_var.set("symbol" in rc)
+
+        mut = cfg.get("mutations", {})
+        self.mutations_var.set(mut.get("profile", "none") if mut else "none")
+
+        pr = cfg.get("position_rules", {})
+        self.must_not_start_var.set(", ".join(pr.get("must_not_start_with", [])))
+        self.must_not_end_var.set(", ".join(pr.get("must_not_end_with", [])))
+        sw = cfg.get("patterns", {}).get("startswith", [])
+        self.must_start_with_var.set(", ".join(sw))
+
+        out = cfg.get("output", {})
+        if out.get("path"):
+            self.output_var.set(out["path"])
+        if out.get("format"):
+            self.fmt_var.set(out["format"])
+        lim = out.get("max_candidates")
+        self.limit_var.set(str(lim) if lim else "")
+
+    # ── Generation ────────────────────────────────────────────────────────────
 
     def _start_generation(self) -> None:
         if self._running:
@@ -486,6 +848,7 @@ class PwgenGUI:
             messagebox.showerror("Rule Error", str(exc))
             return
 
+        self._last_cfg = cfg
         self._stop_flag.clear()
         self._running = True
         self.run_btn.configure(state="disabled")
@@ -493,11 +856,11 @@ class PwgenGUI:
         self.progress_bar.start(12)
         self.stats_label.configure(text="")
         self.count_label.configure(text="Starting…")
-        self._log("─" * 42, "HEADING")
-        self._log(f"Compiling rules for charset={rules.charset[:20]}…")
+        self.nb.select(0)   # show Log tab
+        self._log("-" * 44, "HEADING")
+        self._log(f"Compiling rules  •  charset={rules.charset[:20]}…")
 
-        thread = threading.Thread(target=self._generate_thread, args=(rules,), daemon=True)
-        thread.start()
+        threading.Thread(target=self._generate_thread, args=(rules,), daemon=True).start()
 
     def _stop_generation(self) -> None:
         self._stop_flag.set()
@@ -507,15 +870,13 @@ class PwgenGUI:
         if self._stop_flag.is_set():
             return
         rate_str = f"{rate/1_000_000:.1f}M" if rate >= 1_000_000 else f"{rate/1_000:.1f}K"
-        # Only log milestones, not every tick — avoids log spam
-        if written > 0 and (written % 50_000 == 0 or rate > 0):
+        if written > 0 and written % 50_000 == 0:
             self._log_q.put(("INFO", f"  {written:,} candidates  ({rate_str}/sec)"))
         self.count_label.configure(text=f"{written:,} cands  {rate_str}/s")
 
     def _generate_thread(self, rules) -> None:
         from .generator import generate
         from .mutation_pipeline import apply_mutations, PROFILES
-        from .filter import passes_all
 
         try:
             output_path = rules.output_path
@@ -535,7 +896,7 @@ class PwgenGUI:
                             return
                         yield pw
 
-            self._log(f"Writing → {output_path}")
+            self._log(f"Writing  ->  {output_path}")
             result = run_pipeline(
                 source(), rules,
                 output_path=output_path,
@@ -546,19 +907,22 @@ class PwgenGUI:
             )
 
             lo, hi = result["entropy_range"]
+            total  = result["total"]
+            rate   = result["rate_per_sec"]
+
+            self._log(f"Done!  {total:,} candidates  ->  {output_path}", "OK")
             self._log(
-                f"Done! {result['total']:,} candidates → {output_path}", "OK"
-            )
-            self._log(
-                f"Entropy: {lo:.1f}–{hi:.1f} bits  |  "
-                f"Rate: {result['rate_per_sec']:,}/s  |  "
-                f"Dupes removed: {result['duped_count']:,}", "OK"
+                f"Entropy: {lo:.1f}-{hi:.1f} bits  |  "
+                f"Rate: {rate:,}/s  |  Dupes removed: {result['duped_count']:,}", "OK"
             )
             self.root.after(0, lambda: self.stats_label.configure(
-                text=f"{result['total']:,} candidates  •  {result['rate_per_sec']:,}/s"
+                text=f"{total:,} candidates  •  {rate:,}/s"
             ))
             self.root.after(0, lambda: self.count_label.configure(
-                text=f"{result['total']:,} done"
+                text=f"{total:,} done"
+            ))
+            self.root.after(0, lambda: self._add_history(
+                total, output_path, rules.charset, rules, self._last_cfg.copy()
             ))
 
         except Exception as exc:
@@ -572,17 +936,84 @@ class PwgenGUI:
         self.run_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
 
+    # ── History ───────────────────────────────────────────────────────────────
+
+    def _add_history(self, total: int, file: str,
+                     charset: str, rules, cfg: dict) -> None:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if rules.length:
+            length_str = str(rules.length)
+        else:
+            length_str = f"{rules.min_length}-{rules.max_length}"
+
+        self._history.append({
+            "ts": ts, "candidates": total, "file": file,
+            "charset": charset[:20], "length": length_str, "cfg": cfg,
+        })
+
+        iid = self.hist_tree.insert(
+            "", "end",
+            values=(ts, f"{total:,}", file, charset[:20], length_str),
+        )
+        self._hist_cfg[iid] = cfg
+
+        try:
+            self.hist_empty.pack_forget()
+        except Exception:
+            pass
+
+        self.hist_tree.see(iid)
+
+    def _on_hist_select(self, _=None) -> None:
+        state = "normal" if self.hist_tree.selection() else "disabled"
+        self.hist_reuse_btn.configure(state=state)
+        self.hist_open_btn.configure(state=state)
+
+    def _reuse_history(self) -> None:
+        sel = self.hist_tree.selection()
+        if not sel:
+            return
+        cfg = self._hist_cfg.get(sel[0], {})
+        self._apply_cfg_to_form(cfg)
+        self.nb.select(0)
+        self._log("Settings restored from history.", "OK")
+
+    def _open_hist_file(self) -> None:
+        sel = self.hist_tree.selection()
+        if not sel:
+            return
+        vals = self.hist_tree.item(sel[0], "values")
+        path = vals[2] if len(vals) > 2 else ""
+        if path and os.path.exists(path):
+            os.startfile(path)
+        else:
+            messagebox.showwarning("File Not Found", f"Cannot open:\n{path}")
+
+    def _clear_history(self) -> None:
+        if not self._history:
+            return
+        if messagebox.askyesno(
+            "Clear History",
+            f"Remove all {len(self._history)} history entries?\nThis cannot be undone.",
+        ):
+            self._history.clear()
+            self._hist_cfg.clear()
+            for iid in self.hist_tree.get_children():
+                self.hist_tree.delete(iid)
+            self.hist_reuse_btn.configure(state="disabled")
+            self.hist_open_btn.configure(state="disabled")
+            try:
+                self.hist_empty.pack(pady=6)
+            except Exception:
+                pass
+            self._log("History cleared.", "INFO")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def run_gui() -> None:
     root = tk.Tk()
-    style = ttk.Style(root)
-    style.theme_use("clam")
-    style.configure("TCombobox", fieldbackground="#313244", background="#313244",
-                    foreground="#cdd6f4", selectbackground="#45475a")
-    style.configure("Horizontal.TProgressbar", troughcolor="#313244",
-                    background="#89b4fa", thickness=14)
-
-    app = PwgenGUI(root)
+    PwgenGUI(root)
     root.mainloop()
 
 
