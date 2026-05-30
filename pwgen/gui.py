@@ -37,7 +37,6 @@ from .pipeline import run_pipeline
 
 # ── UI constants ──────────────────────────────────────────────────────────────
 
-_CHARSETS  = list(CHARSETS.keys()) + ["custom"]
 _MUTATIONS = ["none", "standard", "aggressive"]
 _PRESETS   = ["(none)", "numeric_7", "policy_enterprise", "ctf_binary"]
 _FORMATS   = ["txt", "csv", "json", "gz"]
@@ -199,51 +198,75 @@ class PwgenGUI:
         ))
         cf.pack(fill="x", padx=10, pady=(0, 4))
 
-        # Row 0 — Length / Min / Max / Charset
+        # Row 0 — Length / Min / Max
         self._add_row(cf, 0, [
             ("Length (exact)", "length_var", "",   "Exact length overrides Min/Max. Leave blank to use range."),
             ("Min length",     "min_var",    "1",  "Minimum password length (inclusive)."),
             ("Max length",     "max_var",    "16", "Maximum password length (inclusive)."),
         ])
-        self._rl(tk.Label(cf, text="Charset", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=0, column=6, sticky="e", padx=(12, 2), pady=3)
-        self.charset_var = tk.StringVar(value="digits")
-        ttk.Combobox(cf, textvariable=self.charset_var, values=_CHARSETS,
-                     state="readonly", width=12, font=_FONT,
-                    ).grid(row=0, column=7, padx=4, pady=3)
 
-        # Row 1 — Custom chars / No-consec / Max repeats
-        self._rl(tk.Label(cf, text="Custom chars", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=1, column=0, sticky="e", padx=(8, 2), pady=3)
-        self.custom_chars_var = tk.StringVar()
-        cc_e = self._re(tk.Entry(cf, textvariable=self.custom_chars_var, width=14,
+        # Row 1 — Character types (replaces charset dropdown + custom chars)
+        self._rl(tk.Label(cf, text="Include chars", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=1, column=0, sticky="e", padx=(8, 4), pady=4)
+
+        char_frame = self._rf(tk.Frame(cf, bg=t["bg"]))
+        char_frame.grid(row=1, column=1, columnspan=7, sticky="w", pady=4)
+
+        self.inc_digits_var  = tk.BooleanVar(value=True)
+        self.inc_lower_var   = tk.BooleanVar(value=False)
+        self.inc_upper_var   = tk.BooleanVar(value=False)
+        self.inc_symbols_var = tk.BooleanVar(value=False)
+
+        for text, var, tip in [
+            ("0–9  Digits",   self.inc_digits_var,
+             "Include numbers 0-9.\nGood for PIN-style or numeric passwords."),
+            ("a–z  Lowercase", self.inc_lower_var,
+             "Include lowercase English letters a-z."),
+            ("A–Z  Uppercase", self.inc_upper_var,
+             "Include uppercase English letters A-Z."),
+            ("!@#  Symbols",  self.inc_symbols_var,
+             "Include common symbols: !@#$%^&*()_+-=[]{}|;':\",./<>?\nGreat for stronger passwords."),
+        ]:
+            cb = self._rc(tk.Checkbutton(char_frame, text=text, variable=var,
+                bg=t["bg"], fg=t["fg"], selectcolor=t["entry_bg"],
+                activebackground=t["bg"], font=_FONT, cursor="hand2",
+            ))
+            cb.pack(side="left", padx=(0, 14))
+            _Tip(cb, tip)
+
+        # Extra chars field
+        self._rl(tk.Label(char_frame, text="Extra:", bg=t["bg"], fg=t["muted"], font=_FONT_SM),
+             "muted").pack(side="left", padx=(4, 2))
+        self.extra_chars_var = tk.StringVar()
+        ec_e = self._re(tk.Entry(char_frame, textvariable=self.extra_chars_var, width=10,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        cc_e.grid(row=1, column=1, padx=4, pady=3)
-        _Tip(cc_e, 'Only used when Charset = "custom".\nType every allowed character, e.g. abc123!@')
+        ec_e.pack(side="left")
+        _Tip(ec_e, "Add any extra characters not covered by the checkboxes.\ne.g. type  +-=  to also allow those.")
 
+        # Row 2 — No-consec / Max repeats
         self._rl(tk.Label(cf, text="No-consec (char:n)", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=1, column=2, sticky="e", padx=(12, 2), pady=3)
+             ).grid(row=2, column=0, sticky="e", padx=(8, 2), pady=3)
         self.no_consec_var = tk.StringVar()
         nc_e = self._re(tk.Entry(cf, textvariable=self.no_consec_var, width=10,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        nc_e.grid(row=1, column=3, padx=4, pady=3)
+        nc_e.grid(row=2, column=1, padx=4, pady=3)
         _Tip(nc_e, 'No more than N of a character in a row.\ne.g. "0:3" = max 3 zeros  |  "any:3" = any char')
 
         self._rl(tk.Label(cf, text="Max repeats", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=1, column=4, sticky="e", padx=(12, 2), pady=3)
+             ).grid(row=2, column=2, sticky="e", padx=(12, 2), pady=3)
         self.max_repeats_var = tk.StringVar()
         mr_e = self._re(tk.Entry(cf, textvariable=self.max_repeats_var, width=6,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        mr_e.grid(row=1, column=5, padx=4, pady=3)
+        mr_e.grid(row=2, column=3, padx=4, pady=3)
         _Tip(mr_e, "Max times any single digit may appear in the whole password.")
 
-        # Row 2 — Entropy / Walks / Require classes
+        # Row 3 — Entropy / Walks / Require classes
         self._rl(tk.Label(cf, text="Min entropy (bits)", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=2, column=0, sticky="e", padx=(8, 2), pady=3)
+             ).grid(row=3, column=0, sticky="e", padx=(8, 2), pady=3)
         self.entropy_var = tk.StringVar()
         ent_e = self._re(tk.Entry(cf, textvariable=self.entropy_var, width=8,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        ent_e.grid(row=2, column=1, padx=4, pady=3)
+        ent_e.grid(row=3, column=1, padx=4, pady=3)
         _Tip(ent_e, "Shannon entropy in bits.\n30+ moderate  |  50+ strong  |  70+ very strong")
 
         self.no_walks_var = tk.BooleanVar()
@@ -251,10 +274,10 @@ class PwgenGUI:
             text="No keyboard walks", variable=self.no_walks_var,
             bg=t["bg"], fg=t["fg"], selectcolor=t["entry_bg"],
             activebackground=t["bg"], font=_FONT,
-        )).grid(row=2, column=2, columnspan=2, sticky="w", padx=12, pady=3)
+        )).grid(row=3, column=2, columnspan=2, sticky="w", padx=12, pady=3)
 
-        self._rl(tk.Label(cf, text="Require classes", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=2, column=4, sticky="e", padx=(12, 2))
+        self._rl(tk.Label(cf, text="Must contain", bg=t["bg"], fg=t["fg"], font=_FONT)
+             ).grid(row=3, column=4, sticky="e", padx=(12, 2))
         self.req_upper_var  = tk.BooleanVar()
         self.req_lower_var  = tk.BooleanVar()
         self.req_digit_var  = tk.BooleanVar()
@@ -268,37 +291,37 @@ class PwgenGUI:
             self._rc(tk.Checkbutton(cf, text=lbl, variable=var,
                 bg=t["bg"], fg=t["fg"], selectcolor=t["entry_bg"],
                 activebackground=t["bg"], font=_FONT,
-            )).grid(row=2, column=5+i, padx=2, pady=3)
+            )).grid(row=3, column=5+i, padx=2, pady=3)
 
-        # Row 3 — Position rules
+        # Row 4 — Position rules
         self._rl(tk.Label(cf, text="Must not start with", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=3, column=0, sticky="e", padx=(8, 2), pady=3)
+             ).grid(row=4, column=0, sticky="e", padx=(8, 2), pady=3)
         self.must_not_start_var = tk.StringVar()
         mns_e = self._re(tk.Entry(cf, textvariable=self.must_not_start_var, width=14,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        mns_e.grid(row=3, column=1, padx=4, pady=3)
+        mns_e.grid(row=4, column=1, padx=4, pady=3)
         _Tip(mns_e, "Comma-separated.\ne.g. '0,1' rejects passwords starting with 0 or 1.")
 
         self._rl(tk.Label(cf, text="Must not end with", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=3, column=2, sticky="e", padx=(12, 2), pady=3)
+             ).grid(row=4, column=2, sticky="e", padx=(12, 2), pady=3)
         self.must_not_end_var = tk.StringVar()
         mne_e = self._re(tk.Entry(cf, textvariable=self.must_not_end_var, width=14,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        mne_e.grid(row=3, column=3, padx=4, pady=3)
+        mne_e.grid(row=4, column=3, padx=4, pady=3)
         _Tip(mne_e, "Comma-separated.\ne.g. '000,111' rejects passwords ending with those.")
 
         self._rl(tk.Label(cf, text="Must start with", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=3, column=4, sticky="e", padx=(12, 2), pady=3)
+             ).grid(row=4, column=4, sticky="e", padx=(12, 2), pady=3)
         self.must_start_with_var = tk.StringVar()
         msw_e = self._re(tk.Entry(cf, textvariable=self.must_start_with_var, width=14,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        msw_e.grid(row=3, column=5, padx=4, pady=3)
+        msw_e.grid(row=4, column=5, padx=4, pady=3)
         _Tip(msw_e, "Comma-separated prefixes.\ne.g. 'admin,root' keeps only passwords starting with those.")
 
         self._rl(tk.Label(cf,
             text="(comma-separated for position fields)",
             bg=t["bg"], fg=t["muted"], font=_FONT_SM,
-        ), "muted").grid(row=3, column=6, columnspan=3, sticky="w", padx=4)
+        ), "muted").grid(row=4, column=6, columnspan=3, sticky="w", padx=4)
 
         # ── Seed Words + Constraint Hints (side-by-side) ──────────────────────
         sw_row = self._rf(tk.Frame(self.root, bg=t["bg"]))
@@ -738,20 +761,27 @@ class PwgenGUI:
     def _build_cfg(self) -> dict:
         cfg: dict = {}
 
-        # Charset — validate custom before proceeding
-        charset = self.charset_var.get()
-        if charset == "custom":
-            cc = self.custom_chars_var.get().strip()
-            if not cc:
-                raise ValueError(
-                    "Charset is set to 'custom' but no custom characters are defined.\n\n"
-                    "Either enter characters in the 'Custom chars' field\n"
-                    "or choose a different charset (e.g. 'alnum' or 'ascii')."
-                )
-            cfg["charset"] = "custom"
-            cfg["custom_chars"] = cc
-        else:
-            cfg["charset"] = charset
+        # Build charset from the Include checkboxes
+        _DIGITS  = "0123456789"
+        _LOWER   = "abcdefghijklmnopqrstuvwxyz"
+        _UPPER   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        _SYMBOLS = "!@#$%^&*()_+-=[]{}|;':\",./<>?"
+        charset = ""
+        if self.inc_digits_var.get():  charset += _DIGITS
+        if self.inc_lower_var.get():   charset += _LOWER
+        if self.inc_upper_var.get():   charset += _UPPER
+        if self.inc_symbols_var.get(): charset += _SYMBOLS
+        for c in self.extra_chars_var.get():
+            if c not in charset:
+                charset += c
+        if not charset:
+            raise ValueError(
+                "No character types selected.\n\n"
+                "Tick at least one box under 'Include chars'\n"
+                "(Digits, Lowercase, Uppercase, or Symbols)."
+            )
+        cfg["charset"] = "custom"
+        cfg["custom_chars"] = charset
 
         if self.length_var.get().strip():
             cfg["length"] = int(self.length_var.get())
@@ -840,9 +870,21 @@ class PwgenGUI:
 
     def _apply_cfg_to_form(self, cfg: dict) -> None:
         """Populate all form fields from a cfg dict (preset load + history reuse)."""
+        # Restore charset checkboxes from named charset or custom_chars string
         cs = cfg.get("charset", "digits")
-        if cs in _CHARSETS: self.charset_var.set(cs)
-        self.custom_chars_var.set(cfg.get("custom_chars", ""))
+        cc = cfg.get("custom_chars", "")
+        if cs == "custom" and cc:
+            chars = cc
+        else:
+            chars = CHARSETS.get(cs, "0123456789")
+        self.inc_digits_var.set(any(c.isdigit()     for c in chars))
+        self.inc_lower_var.set(any(c.islower()      for c in chars))
+        self.inc_upper_var.set(any(c.isupper()      for c in chars))
+        self.inc_symbols_var.set(any(not c.isalnum() for c in chars))
+        # Anything outside standard sets goes in Extra
+        _std = set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                   "!@#$%^&*()_+-=[]{}|;':\",./<>?")
+        self.extra_chars_var.set("".join(c for c in chars if c not in _std))
 
         if "length" in cfg:
             self.length_var.set(str(cfg["length"]))
@@ -898,12 +940,12 @@ class PwgenGUI:
             messagebox.showerror("Configuration Error", str(exc))
             return
 
-        # Warn if require_classes impossible with current charset
-        req  = set(getattr(rules, "require_classes", []))
-        has_upper  = any(c.isupper()       for c in rules.charset)
-        has_lower  = any(c.islower()       for c in rules.charset)
-        has_digit  = any(c.isdigit()       for c in rules.charset)
-        has_symbol = any(not c.isalnum()   for c in rules.charset)
+        # Warn if require_classes is impossible with the built charset
+        req        = set(getattr(rules, "require_classes", []))
+        has_upper  = any(c.isupper()     for c in rules.charset)
+        has_lower  = any(c.islower()     for c in rules.charset)
+        has_digit  = any(c.isdigit()     for c in rules.charset)
+        has_symbol = any(not c.isalnum() for c in rules.charset)
         impossible = (
             ("upper"  in req and not has_upper)  or
             ("lower"  in req and not has_lower)  or
@@ -913,10 +955,11 @@ class PwgenGUI:
         if impossible:
             messagebox.showerror(
                 "Impossible Constraint",
-                "One or more 'Require classes' boxes are ticked, but the chosen\n"
-                "charset doesn't contain those character types.\n\n"
-                "This will produce 0 candidates.\n\n"
-                "Fix: uncheck the mismatched boxes, or change Charset to 'ascii' / 'alnum'.",
+                "One or more 'Must contain' classes are ticked, but the\n"
+                "selected character types can't satisfy them.\n\n"
+                "Example: 'Must contain upper' requires A-Z to be included.\n\n"
+                "Fix: tick the matching box under 'Include chars' too,\n"
+                "or uncheck the conflicting 'Must contain' box.",
             )
             return
 
