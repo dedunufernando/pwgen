@@ -1,5 +1,5 @@
 """
-pwgen GUI  —  dark / light theme · seed words · history · hints · position rules.
+Mr.Pass GUI — dark / light theme · seed words · history · hints · position rules.
 
 Layout
 ------
@@ -24,7 +24,10 @@ Modes
 from __future__ import annotations
 import datetime
 import os
+import pathlib
 import queue
+import subprocess
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -34,6 +37,16 @@ from .hint_parser import parse_hints
 from .rule_compiler import compile_rules, RuleConflictError, CHARSETS
 from .pipeline import run_pipeline
 
+# ── Default output directory ──────────────────────────────────────────────────
+_OUTPUT_DIR = pathlib.Path.home() / "Documents" / "MrPass"
+
+def _ensure_output_dir() -> None:
+    try:
+        _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+_ensure_output_dir()
 
 # ── UI constants ──────────────────────────────────────────────────────────────
 
@@ -61,22 +74,69 @@ DARK: dict[str, str] = {
     "hint_bg":  "#2a1e2e",   # subtle purple tint for hints
 }
 
-# ── Soft indigo light (attractive, not flat white) ───────────────────────────
+# ── Violet Bloom (light) — vibrant soft purple palette ───────────────────────
 LIGHT: dict[str, str] = {
-    "bg":       "#eef1fb",   # periwinkle-white — warm tinted background
-    "fg":       "#1e2045",   # deep indigo text — high contrast
-    "accent":   "#3b5bdb",   # vivid indigo accent
-    "btn_run":  "#2f9e44",   # forest green
-    "btn_stop": "#e03131",   # deep red
+    "bg":       "#f5f0ff",   # lavender-50 — warm violet background
+    "fg":       "#2d1b6e",   # deep violet text — rich contrast
+    "accent":   "#7c3aed",   # violet-600 — vivid accent
+    "btn_run":  "#059669",   # emerald-600
+    "btn_stop": "#dc2626",   # red-600
     "btn_fg":   "#ffffff",
-    "entry_bg": "#ffffff",   # pure white inputs — pop against tinted bg
-    "log_bg":   "#dde3f7",   # muted indigo log panel
-    "muted":    "#6e79b5",   # softer indigo for hints/captions
-    "warn":     "#e67700",   # amber
-    "sel_bg":   "#bac8ff",   # indigo-200 selection highlight
-    "seed_bg":  "#e3f5ff",   # sky-blue tint for seed panel
-    "hint_bg":  "#f3e8ff",   # lavender tint for hints panel
+    "entry_bg": "#ffffff",   # pure white inputs pop off tinted bg
+    "log_bg":   "#ede9fe",   # violet-100 log panel
+    "muted":    "#8b5cf6",   # violet-500 for secondary text
+    "warn":     "#d97706",   # amber-600
+    "sel_bg":   "#ddd6fe",   # violet-200 selection
+    "seed_bg":  "#ecfdf5",   # emerald-50 — refreshing green for seeds
+    "hint_bg":  "#fff7ed",   # orange-50 — warm for hints
 }
+
+# ── Placeholder helper ────────────────────────────────────────────────────────
+
+class _Placeholder:
+    """Gray placeholder text that disappears on focus and returns when empty."""
+
+    def __init__(self, widget: tk.Text, text: str, muted_color: str) -> None:
+        self._w        = widget
+        self._text     = text
+        self._muted    = muted_color
+        self._active   = False
+        self._real_fg  = widget.cget("fg")
+        self._show()
+        widget.bind("<FocusIn>",  self._on_focus_in)
+        widget.bind("<FocusOut>", self._on_focus_out)
+
+    def _show(self) -> None:
+        self._w.configure(state="normal")
+        self._w.delete("1.0", "end")
+        self._w.insert("1.0", self._text)
+        self._w.configure(fg=self._muted)
+        self._active = True
+
+    def _on_focus_in(self, _=None) -> None:
+        if self._active:
+            self._w.delete("1.0", "end")
+            self._w.configure(fg=self._real_fg)
+            self._active = False
+
+    def _on_focus_out(self, _=None) -> None:
+        if not self._w.get("1.0", "end").strip():
+            self._show()
+
+    def get_real(self) -> str:
+        """Return real content (empty string when placeholder is showing)."""
+        if self._active:
+            return ""
+        return self._w.get("1.0", "end").strip()
+
+    def update_colors(self, fg: str, muted: str) -> None:
+        """Called after theme switch."""
+        self._real_fg = fg
+        self._muted   = muted
+        if self._active:
+            self._w.configure(fg=muted)
+        else:
+            self._w.configure(fg=fg)
 
 
 # ── Tooltip ───────────────────────────────────────────────────────────────────
@@ -101,7 +161,7 @@ class _Tip:
         if self._top: self._top.destroy(); self._top = None
 
 
-# ── PwgenGUI ──────────────────────────────────────────────────────────────────
+# ── MrPassGUI ─────────────────────────────────────────────────────────────────
 
 class PwgenGUI:
 
@@ -109,9 +169,9 @@ class PwgenGUI:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("pwgen — Password List Generator")
+        self.root.title("Mr.Pass — Password List Generator")
         self.root.resizable(True, True)
-        self.root.minsize(760, 740)
+        self.root.minsize(800, 760)
 
         self._stop_flag = threading.Event()
         self._log_q: queue.Queue = queue.Queue()
@@ -134,6 +194,10 @@ class PwgenGUI:
         self._rbtns_n:  list[tk.Button]      = []   # neutral buttons
         self._rtexts:   list[tuple]          = []   # (Text, bg_key)
 
+        # Placeholder helpers
+        self._seed_ph: _Placeholder | None = None
+        self._hint_ph: _Placeholder | None = None
+
         self._build_ui()
         self._apply_ttk_style()
         self._poll_log()
@@ -144,7 +208,7 @@ class PwgenGUI:
         self._rlabels.append((w, fg)); return w
 
     def _rf(self, w: tk.Frame, bg: str = "bg") -> tk.Frame:
-        self._rframes.append(w); return w    # bg is always "bg" for plain frames
+        self._rframes.append(w); return w
 
     def _re(self, w: tk.Entry) -> tk.Entry:
         self._rentries.append(w); return w
@@ -171,8 +235,8 @@ class PwgenGUI:
         top.pack(fill="x", padx=10, pady=(8, 2))
 
         self._rl(tk.Label(top,
-            text="pwgen  •  Password Candidate Generator",
-            font=("Consolas", 13, "bold"), bg=t["bg"], fg=t["accent"],
+            text="Mr.Pass  •  Password Candidate Generator",
+            font=("Consolas", 14, "bold"), bg=t["bg"], fg=t["accent"],
         ), "accent").pack(side="left")
 
         self.theme_btn = self._rbn(tk.Button(
@@ -185,8 +249,8 @@ class PwgenGUI:
         self.theme_btn.pack(side="right")
 
         self._rl(tk.Label(self.root,
-            text="FOR AUTHORIZED SECURITY TESTING ONLY",
-            font=_FONT_SM, bg=t["bg"], fg=t["btn_stop"],
+            text="⚠  FOR AUTHORIZED SECURITY TESTING, CTF & PENTESTING ONLY",
+            font=("Consolas", 9, "bold"), bg=t["bg"], fg=t["btn_stop"],
         ), "btn_stop").pack(fill="x", padx=10)
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", pady=6)
@@ -205,7 +269,7 @@ class PwgenGUI:
             ("Max length",     "max_var",    "16", "Maximum password length (inclusive)."),
         ])
 
-        # Row 1 — Character types (replaces charset dropdown + custom chars)
+        # Row 1 — Character types
         self._rl(tk.Label(cf, text="Include chars", bg=t["bg"], fg=t["fg"], font=_FONT)
              ).grid(row=1, column=0, sticky="e", padx=(8, 4), pady=4)
 
@@ -218,13 +282,13 @@ class PwgenGUI:
         self.inc_symbols_var = tk.BooleanVar(value=False)
 
         for text, var, tip in [
-            ("0–9  Digits",   self.inc_digits_var,
+            ("0–9  Digits",    self.inc_digits_var,
              "Include numbers 0-9.\nGood for PIN-style or numeric passwords."),
             ("a–z  Lowercase", self.inc_lower_var,
              "Include lowercase English letters a-z."),
             ("A–Z  Uppercase", self.inc_upper_var,
              "Include uppercase English letters A-Z."),
-            ("!@#  Symbols",  self.inc_symbols_var,
+            ("!@#  Symbols",   self.inc_symbols_var,
              "Include common symbols: !@#$%^&*()_+-=[]{}|;':\",./<>?\nGreat for stronger passwords."),
         ]:
             cb = self._rc(tk.Checkbutton(char_frame, text=text, variable=var,
@@ -234,7 +298,6 @@ class PwgenGUI:
             cb.pack(side="left", padx=(0, 14))
             _Tip(cb, tip)
 
-        # Extra chars field
         self._rl(tk.Label(char_frame, text="Extra:", bg=t["bg"], fg=t["muted"], font=_FONT_SM),
              "muted").pack(side="left", padx=(4, 2))
         self.extra_chars_var = tk.StringVar()
@@ -260,7 +323,7 @@ class PwgenGUI:
         mr_e.grid(row=2, column=3, padx=4, pady=3)
         _Tip(mr_e, "Max times any single digit may appear in the whole password.")
 
-        # Row 3 — Entropy / Walks
+        # Row 3 — Entropy / Walks / hint pointer
         self._rl(tk.Label(cf, text="Min entropy (bits)", bg=t["bg"], fg=t["fg"], font=_FONT)
              ).grid(row=3, column=0, sticky="e", padx=(8, 2), pady=3)
         self.entropy_var = tk.StringVar()
@@ -277,7 +340,7 @@ class PwgenGUI:
         )).grid(row=3, column=2, columnspan=2, sticky="w", padx=12, pady=3)
 
         self._rl(tk.Label(cf,
-            text='Use Constraint Hints below to add rules like "must have digit" or "must have upper"',
+            text='💡 Use Constraint Hints below  →  "must have digit"  "must have upper"',
             bg=t["bg"], fg=t["muted"], font=_FONT_SM,
         ), "muted").grid(row=3, column=4, columnspan=5, sticky="w", padx=8, pady=3)
 
@@ -317,7 +380,7 @@ class PwgenGUI:
 
         # LEFT — Seed Words (wordlist mode)
         sf = self._rlf(tk.LabelFrame(sw_row,
-            text=" Seed Words  (wordlist mode) ", font=_FONT_H,
+            text=" 🌱 Seed Words  (wordlist mode) ", font=_FONT_H,
             bg=t["seed_bg"], fg=t["accent"], bd=1, relief="groove",
         ), "seed_bg")
         sf.pack(side="left", fill="both", expand=True, padx=(0, 4))
@@ -327,7 +390,7 @@ class PwgenGUI:
         self._rframes.append(seed_hdr)
         self._rl(tk.Label(seed_hdr,
             text="Type base words (names, dates, keywords) — one per line.\n"
-                 "The tool generates password mutations from each word.",
+                 "Leave blank for combinatorial mode (all combinations).",
             bg=t["seed_bg"], fg=t["fg"], font=_FONT_SM,
             justify="left",
         ), "fg").pack(side="left")
@@ -341,17 +404,23 @@ class PwgenGUI:
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"],
             font=_FONT, height=4, wrap="word",
         )
-        self.seed_text.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        self.seed_text.pack(fill="both", expand=True, padx=6, pady=(2, 2))
         self._rt(self.seed_text, "entry_bg")
 
+        self._seed_ph = _Placeholder(
+            self.seed_text,
+            "e.g.\nJohn\ndedunu\n2004\nwattala",
+            t["muted"],
+        )
+
         self._rl(tk.Label(sf,
-            text="Tip: set Mutations to 'standard' or 'aggressive' for more variants",
+            text="💡 Set Mutations → 'standard' or 'aggressive' for more variants",
             bg=t["seed_bg"], fg=t["muted"], font=_FONT_SM,
         ), "muted").pack(anchor="w", padx=6, pady=(0, 4))
 
         # RIGHT — Constraint Hints
         hf = self._rlf(tk.LabelFrame(sw_row,
-            text=" Constraint Hints  (plain language) ", font=_FONT_H,
+            text=" 💬 Constraint Hints  (plain language) ", font=_FONT_H,
             bg=t["hint_bg"], fg=t["accent"], bd=1, relief="groove",
         ), "hint_bg")
         hf.pack(side="right", fill="both", expand=True, padx=(4, 0))
@@ -360,7 +429,7 @@ class PwgenGUI:
         hint_hdr.pack(fill="x", padx=6, pady=(4, 0))
         self._rframes.append(hint_hdr)
         self._rl(tk.Label(hint_hdr,
-            text='One per line — e.g.\n"7 characters"  •  "no 3 zeros in a row"  •  "must have digit"',
+            text='One rule per line in plain English.\nThe tool understands natural language constraints.',
             bg=t["hint_bg"], fg=t["fg"], font=_FONT_SM,
             justify="left",
         ), "fg").pack(side="left")
@@ -374,11 +443,17 @@ class PwgenGUI:
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"],
             font=_FONT, height=4, wrap="word",
         )
-        self.hints_text.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        self.hints_text.pack(fill="both", expand=True, padx=6, pady=(2, 2))
         self._rt(self.hints_text, "entry_bg")
 
+        self._hint_ph = _Placeholder(
+            self.hints_text,
+            "e.g.\n7 characters\nmust have digit\nno 3 zeros in a row\nno keyboard walk",
+            t["muted"],
+        )
+
         self._rl(tk.Label(hf,
-            text='Also: "no keyboard walk"  •  "starts with admin"  •  "25 bits entropy"',
+            text='Also: "starts with admin"  •  "25 bits entropy"  •  "digits only"',
             bg=t["hint_bg"], fg=t["muted"], font=_FONT_SM,
         ), "muted").pack(anchor="w", padx=6, pady=(0, 4))
 
@@ -391,28 +466,38 @@ class PwgenGUI:
 
         self._rl(tk.Label(of, text="File", bg=t["bg"], fg=t["fg"], font=_FONT)
              ).grid(row=0, column=0, sticky="e", padx=(8, 2), pady=4)
-        self.output_var = tk.StringVar(value="wordlist.txt")
-        self._re(tk.Entry(of, textvariable=self.output_var, width=36,
+
+        # Default output path inside MrPass folder
+        default_out = str(_OUTPUT_DIR / "wordlist.txt")
+        self.output_var = tk.StringVar(value=default_out)
+        self._re(tk.Entry(of, textvariable=self.output_var, width=34,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT)
              ).grid(row=0, column=1, padx=4, pady=4)
+
         self._rbn(tk.Button(of, text="Browse…", command=self._browse_output,
             bg=t["entry_bg"], fg=t["fg"], font=_FONT,
             activebackground=t["accent"], activeforeground=t["bg"],
-        )).grid(row=0, column=2, padx=4, pady=4)
+        )).grid(row=0, column=2, padx=(4, 2), pady=4)
+
+        self._rbn(tk.Button(of, text="📂 Open Folder", command=self._open_output_folder,
+            bg=t["entry_bg"], fg=t["fg"], font=_FONT,
+            activebackground=t["accent"], activeforeground=t["bg"],
+            cursor="hand2",
+        )).grid(row=0, column=3, padx=(2, 8), pady=4)
 
         self._rl(tk.Label(of, text="Format", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=0, column=3, sticky="e", padx=(12, 2))
+             ).grid(row=0, column=4, sticky="e", padx=(4, 2))
         self.fmt_var = tk.StringVar(value="txt")
         ttk.Combobox(of, textvariable=self.fmt_var, values=_FORMATS,
                      state="readonly", width=6, font=_FONT,
-                    ).grid(row=0, column=4, padx=4, pady=4)
+                    ).grid(row=0, column=5, padx=4, pady=4)
 
         self._rl(tk.Label(of, text="Mutations", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=0, column=5, sticky="e", padx=(12, 2))
+             ).grid(row=0, column=6, sticky="e", padx=(8, 2))
         self.mutations_var = tk.StringVar(value="none")
         ttk.Combobox(of, textvariable=self.mutations_var, values=_MUTATIONS,
                      state="readonly", width=12, font=_FONT,
-                    ).grid(row=0, column=6, padx=4, pady=4)
+                    ).grid(row=0, column=7, padx=4, pady=4)
 
         self._rl(tk.Label(of, text="Preset", bg=t["bg"], fg=t["fg"], font=_FONT)
              ).grid(row=1, column=0, sticky="e", padx=(8, 2), pady=4)
@@ -423,21 +508,21 @@ class PwgenGUI:
         self._rbn(tk.Button(of, text="Load preset", command=self._load_preset,
             bg=t["entry_bg"], fg=t["fg"], font=_FONT,
             activebackground=t["accent"], activeforeground=t["bg"],
-        )).grid(row=1, column=2, padx=4, pady=4)
+        )).grid(row=1, column=2, columnspan=2, padx=4, pady=4)
 
         self._rl(tk.Label(of, text="Limit candidates", bg=t["bg"], fg=t["fg"], font=_FONT)
-             ).grid(row=1, column=3, sticky="e", padx=(12, 2))
+             ).grid(row=1, column=4, sticky="e", padx=(4, 2))
         self.limit_var = tk.StringVar()
         lim_e = self._re(tk.Entry(of, textvariable=self.limit_var, width=12,
             bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"], font=_FONT))
-        lim_e.grid(row=1, column=4, padx=4, pady=4)
+        lim_e.grid(row=1, column=5, padx=4, pady=4)
         _Tip(lim_e, "Stop after this many candidates. Leave blank for unlimited.")
 
         # Mode indicator
         self.mode_label = self._rl(tk.Label(of,
             text="Mode: combinatorial", bg=t["bg"], fg=t["muted"], font=_FONT_SM,
         ), "muted")
-        self.mode_label.grid(row=1, column=5, columnspan=2, sticky="w", padx=12)
+        self.mode_label.grid(row=1, column=6, columnspan=2, sticky="w", padx=12)
         self.seed_text.bind("<<Modified>>", self._update_mode_label)
         self.seed_text.bind("<KeyRelease>", self._update_mode_label)
 
@@ -471,7 +556,7 @@ class PwgenGUI:
         self.progress_bar = ttk.Progressbar(pf, variable=self.progress_var, mode="indeterminate")
         self.progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.count_label = self._rl(
-            tk.Label(pf, text="", bg=t["bg"], fg=t["fg"], font=_FONT, width=34)
+            tk.Label(pf, text="Ready — fill in constraints and click Generate", bg=t["bg"], fg=t["fg"], font=_FONT, width=40)
         )
         self.count_label.pack(side="left")
 
@@ -488,6 +573,13 @@ class PwgenGUI:
         self.log_box.pack(fill="both", expand=True, padx=4, pady=4)
         self._rt(self.log_box, "log_bg")
         self._refresh_log_tags()
+
+        # Write a welcome message to the log
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", "[INFO] Mr.Pass ready.\n", "INFO")
+        self.log_box.insert("end", f"[INFO] Output folder: {_OUTPUT_DIR}\n", "INFO")
+        self.log_box.insert("end", "[INFO] Fill in constraints above and click ▶ Generate.\n", "INFO")
+        self.log_box.configure(state="disabled")
 
         hist_tab = self._rf(tk.Frame(self.nb, bg=t["bg"]))
         self.nb.add(hist_tab, text="  History  ")
@@ -511,7 +603,7 @@ class PwgenGUI:
         for col, heading, width, anchor in [
             ("ts",         "Timestamp",   155, "w"),
             ("candidates", "Candidates",  100, "e"),
-            ("file",       "Output File", 200, "w"),
+            ("file",       "Output File", 210, "w"),
             ("charset",    "Charset",      75, "w"),
             ("length",     "Length",       65, "w"),
             ("mode",       "Mode",         90, "w"),
@@ -549,7 +641,7 @@ class PwgenGUI:
         _Tip(self.hist_reuse_btn, "Restore all settings from the selected run into the form.")
 
         self.hist_open_btn = self._rbn(tk.Button(btn_row,
-            text="Open File", command=self._open_hist_file,
+            text="📂 Open File", command=self._open_hist_file,
             bg=t["entry_bg"], fg=t["fg"], font=_FONT,
             relief="flat", padx=10, pady=4, cursor="hand2",
             activebackground=t["accent"], activeforeground=t["bg"],
@@ -558,7 +650,7 @@ class PwgenGUI:
         self.hist_open_btn.pack(side="left", padx=(0, 6))
 
         self.hist_clear_btn = tk.Button(btn_row,
-            text="Clear History", command=self._clear_history,
+            text="🗑  Clear History", command=self._clear_history,
             bg=t["entry_bg"], fg=t["btn_stop"], font=_FONT,
             relief="flat", padx=10, pady=4, cursor="hand2",
             activebackground=t["btn_stop"], activeforeground=t["btn_fg"],
@@ -586,7 +678,6 @@ class PwgenGUI:
 
         for w, fg_key in self._rlabels:
             try:
-                # Figure out which bg the label sits on (best effort)
                 parent_bg = t.get(_bg_key_for(w), t["bg"])
                 w.configure(bg=parent_bg, fg=t[fg_key])
             except tk.TclError: pass
@@ -613,7 +704,7 @@ class PwgenGUI:
             try: w.configure(bg=t[bg_key], fg=t["fg"], insertbackground=t["fg"])
             except tk.TclError: pass
 
-        # Fix seed/hint frame child labels (they sit on seed_bg / hint_bg)
+        # Fix labels inside LabelFrames (seed_bg / hint_bg panels)
         for w, fg_key in self._rlabels:
             try:
                 if isinstance(w.master, tk.Frame):
@@ -625,6 +716,16 @@ class PwgenGUI:
                                 break
             except (tk.TclError, AttributeError): pass
 
+        # Fix frames that sit inside LabelFrames (seed_hdr / hint_hdr)
+        for w in self._rframes:
+            try:
+                if isinstance(w.master, tk.LabelFrame):
+                    for (lf, bg_key_lf) in self._rlframes:
+                        if lf is w.master:
+                            w.configure(bg=t[bg_key_lf])
+                            break
+            except (tk.TclError, AttributeError): pass
+
         try:
             self.run_btn.configure(bg=t["btn_run"], fg=t["btn_fg"], activebackground=t["btn_run"])
             self.stop_btn.configure(bg=t["btn_stop"], fg=t["btn_fg"], activebackground=t["btn_stop"])
@@ -632,6 +733,12 @@ class PwgenGUI:
                                           activebackground=t["btn_stop"],
                                           activeforeground=t["btn_fg"])
         except (tk.TclError, AttributeError): pass
+
+        # Update placeholder colors
+        if self._seed_ph:
+            self._seed_ph.update_colors(t["fg"], t["muted"])
+        if self._hint_ph:
+            self._hint_ph.update_colors(t["fg"], t["muted"])
 
         self._refresh_log_tags()
 
@@ -709,14 +816,20 @@ class PwgenGUI:
         self.root.after(100, self._poll_log)
 
     def _clear_seeds(self) -> None:
+        self.seed_text.configure(fg=self.t["fg"])
         self.seed_text.delete("1.0", "end")
+        if self._seed_ph:
+            self._seed_ph._active = False
         self._update_mode_label()
 
     def _clear_hints(self) -> None:
+        self.hints_text.configure(fg=self.t["fg"])
         self.hints_text.delete("1.0", "end")
+        if self._hint_ph:
+            self._hint_ph._active = False
 
     def _update_mode_label(self, _=None) -> None:
-        seeds = self.seed_text.get("1.0", "end").strip()
+        seeds = self._seed_ph.get_real() if self._seed_ph else self.seed_text.get("1.0", "end").strip()
         if seeds:
             words = [w for w in seeds.splitlines() if w.strip()]
             self.mode_label.configure(
@@ -727,12 +840,31 @@ class PwgenGUI:
             self.mode_label.configure(text="Mode: combinatorial", fg=self.t["muted"])
 
     def _browse_output(self) -> None:
+        initial = str(_OUTPUT_DIR)
         path = filedialog.asksaveasfilename(
+            initialdir=initial,
             defaultextension=".txt",
             filetypes=[("Text","*.txt"),("Gzip","*.gz"),
                        ("CSV","*.csv"),("JSON","*.json"),("All","*.*")],
         )
         if path: self.output_var.set(path)
+
+    def _open_output_folder(self) -> None:
+        """Open the folder that contains the current output file."""
+        out_path = self.output_var.get().strip() or str(_OUTPUT_DIR)
+        folder = str(pathlib.Path(out_path).parent)
+        # Make sure it exists
+        try: pathlib.Path(folder).mkdir(parents=True, exist_ok=True)
+        except Exception: pass
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as exc:
+            messagebox.showwarning("Cannot Open Folder", str(exc))
 
     def _load_preset(self) -> None:
         import json; from pathlib import Path
@@ -743,6 +875,72 @@ class PwgenGUI:
             self._log(f"Preset not found: {pp}", "WARN"); return
         self._apply_cfg_to_form(json.loads(pp.read_text()))
         self._log(f"Preset '{preset}' loaded.", "OK")
+
+    # ── Validation ────────────────────────────────────────────────────────────
+
+    def _pre_generate_checks(self) -> bool:
+        """Run friendly pre-flight checks. Return False to abort, True to proceed."""
+        issues: list[str] = []
+        tips:   list[str] = []
+
+        # 1. Check at least one char type selected
+        if not any([
+            self.inc_digits_var.get(),
+            self.inc_lower_var.get(),
+            self.inc_upper_var.get(),
+            self.inc_symbols_var.get(),
+            self.extra_chars_var.get().strip(),
+        ]):
+            issues.append("• No character types selected.\n  Tick at least one box under 'Include chars'.")
+
+        # 2. Check combinatorial mode without length bounds
+        seed_raw = self._seed_ph.get_real() if self._seed_ph else self.seed_text.get("1.0", "end").strip()
+        if not seed_raw:
+            length_set  = self.length_var.get().strip()
+            max_set     = self.max_var.get().strip()
+            max_val     = int(max_set) if max_set.isdigit() else 16
+            if not length_set and max_val > 10:
+                tips.append(
+                    f"• Combinatorial mode with Max length={max_val} can generate\n"
+                    f"  billions of candidates — consider setting Length (exact)\n"
+                    f"  or a lower Max length, or using Limit candidates."
+                )
+
+        # 3. Wordlist mode tip about length filter
+        if seed_raw:
+            length_set = self.length_var.get().strip()
+            if length_set and length_set.isdigit():
+                target_len = int(length_set)
+                words = [w.strip() for w in seed_raw.splitlines() if w.strip()]
+                mismatched = [w for w in words if len(w) != target_len]
+                if mismatched:
+                    tips.append(
+                        f"• You have an exact Length={target_len} set.\n"
+                        f"  {len(mismatched)} of your {len(words)} seed word(s) have\n"
+                        f"  different lengths and will be filtered out.\n"
+                        f"  Clear the Length field to accept all seeds."
+                    )
+            if self.mutations_var.get() == "none":
+                tips.append(
+                    "• Wordlist mode with Mutations='none' only outputs exact seed words.\n"
+                    "  Set Mutations → 'standard' or 'aggressive' for more variants."
+                )
+
+        if issues:
+            messagebox.showerror(
+                "Mr.Pass — Fix before generating",
+                "Please fix the following before generating:\n\n" + "\n\n".join(issues)
+            )
+            return False
+
+        if tips:
+            answer = messagebox.askokcancel(
+                "Mr.Pass — Heads up",
+                "A few things to note:\n\n" + "\n\n".join(tips) + "\n\nContinue anyway?"
+            )
+            return bool(answer)
+
+        return True
 
     # ── Config ────────────────────────────────────────────────────────────────
 
@@ -808,7 +1006,7 @@ class PwgenGUI:
                 v.strip() for v in self.must_start_with_var.get().split(",") if v.strip()]
 
         # Constraint hints — merge; explicit GUI fields take priority
-        hints_raw = self.hints_text.get("1.0", "end").strip()
+        hints_raw = self._hint_ph.get_real() if self._hint_ph else self.hints_text.get("1.0", "end").strip()
         if hints_raw:
             hint_lines = [ln.strip() for ln in hints_raw.splitlines() if ln.strip()]
             hint_cfg = parse_hints(hint_lines)
@@ -822,26 +1020,36 @@ class PwgenGUI:
                         cfg.setdefault("charset_options", {}).setdefault(ok, ov)
 
         # Seed words — wordlist mode
-        seed_raw = self.seed_text.get("1.0", "end").strip()
+        seed_raw = self._seed_ph.get_real() if self._seed_ph else self.seed_text.get("1.0", "end").strip()
         if seed_raw:
             words = [w.strip() for w in seed_raw.splitlines() if w.strip()]
             if words:
                 # Auto-expand charset so letters/symbols in seeds aren't filtered out
-                if cfg.get("charset") == "digits":
+                if cfg.get("charset") == "digits" or (
+                    cfg.get("charset") == "custom" and
+                    cfg.get("custom_chars", "").isdigit()
+                ):
                     cfg["charset"] = "ascii"
                     self._log("Charset auto-expanded to 'ascii' for wordlist mode.", "INFO")
                 # Write seeds to temp file
-                fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="pwgen_seeds_")
+                fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="mrpass_seeds_")
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     for w in words:
                         f.write(w + "\n")
                 self._seed_tmp = tmp
                 cfg["wordlist"] = {"tier": "none", "custom_path": tmp}
 
+        # Output path — ensure parent directory exists
+        out_path = self.output_var.get().strip() or str(_OUTPUT_DIR / "wordlist.txt")
+        try:
+            pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
         limit = self.limit_var.get().strip()
         cfg["output"] = {
             "format": self.fmt_var.get(),
-            "path":   self.output_var.get() or "wordlist.txt",
+            "path":   out_path,
             "include_header": True,
             "sort_by": "none",
             **({"max_candidates": int(limit)} if limit else {}),
@@ -850,7 +1058,6 @@ class PwgenGUI:
 
     def _apply_cfg_to_form(self, cfg: dict) -> None:
         """Populate all form fields from a cfg dict (preset load + history reuse)."""
-        # Restore charset checkboxes from named charset or custom_chars string
         cs = cfg.get("charset", "digits")
         cc = cfg.get("custom_chars", "")
         if cs == "custom" and cc:
@@ -861,7 +1068,6 @@ class PwgenGUI:
         self.inc_lower_var.set(any(c.islower()      for c in chars))
         self.inc_upper_var.set(any(c.isupper()      for c in chars))
         self.inc_symbols_var.set(any(not c.isalnum() for c in chars))
-        # Anything outside standard sets goes in Extra
         _std = set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
                    "!@#$%^&*()_+-=[]{}|;':\",./<>?")
         self.extra_chars_var.set("".join(c for c in chars if c not in _std))
@@ -907,6 +1113,11 @@ class PwgenGUI:
 
     def _start_generation(self) -> None:
         if self._running: return
+
+        # Pre-flight checks
+        if not self._pre_generate_checks():
+            return
+
         try:
             cfg   = self._build_cfg()
             rules = compile_rules(cfg)
@@ -923,10 +1134,12 @@ class PwgenGUI:
         self.stats_label.configure(text="")
         self.count_label.configure(text="Starting…")
         self.nb.select(0)
-        self._log("-" * 44, "HEADING")
+        self._log("─" * 44, "HEADING")
         is_wordlist = bool(cfg.get("wordlist", {}).get("custom_path"))
         mode_str = "wordlist" if is_wordlist else "combinatorial"
-        self._log(f"Mode: {mode_str}  |  charset={rules.charset[:24]}…")
+        charset_preview = rules.charset[:20] + ("…" if len(rules.charset) > 20 else "")
+        self._log(f"Mode: {mode_str}  |  charset: {charset_preview}")
+        self._log(f"Output: {rules.output_path}")
 
         threading.Thread(target=self._generate_thread, args=(rules,), daemon=True).start()
 
@@ -951,6 +1164,10 @@ class PwgenGUI:
             if rules.wordlist_tier != "none" or rules.wordlist_custom_path:
                 from .seed_loader import load_wordlist
                 enabled = rules.mutations_enabled or PROFILES.get(rules.mutations_profile, [])
+                self._log(
+                    f"Wordlist mode — {len(enabled)} mutation type(s): "
+                    f"{', '.join(enabled) if enabled else 'none (exact match only)'}"
+                )
                 def source():
                     for base in load_wordlist(rules):
                         if self._stop_flag.is_set(): return
@@ -961,7 +1178,7 @@ class PwgenGUI:
                         if self._stop_flag.is_set(): return
                         yield pw
 
-            self._log(f"Writing  ->  {output_path}")
+            self._log(f"Writing  →  {output_path}")
             result = run_pipeline(
                 source(), rules,
                 output_path=output_path,
@@ -975,19 +1192,25 @@ class PwgenGUI:
             total, rate = result["total"], result["rate_per_sec"]
 
             if total == 0:
-                self._log("WARNING: 0 candidates written. "
-                          "Check charset vs require_classes, or add seed words.", "WARN")
-            else:
-                self._log(f"Done!  {total:,} candidates  ->  {output_path}", "OK")
                 self._log(
-                    f"Entropy: {lo:.1f}-{hi:.1f} bits  |  "
+                    "0 candidates written. Possible causes:\n"
+                    "  • Seed words filtered by Length constraint (try clearing Length)\n"
+                    "  • Charset doesn't match seed words (try adding Lowercase/Uppercase)\n"
+                    "  • Mutations='none' with very restrictive constraints\n"
+                    "  • Require-class rules impossible with current charset",
+                    "WARN"
+                )
+            else:
+                self._log(f"✓ Done!  {total:,} candidates  →  {output_path}", "OK")
+                self._log(
+                    f"Entropy: {lo:.1f}–{hi:.1f} bits  |  "
                     f"Rate: {rate:,}/s  |  Dupes removed: {result['duped_count']:,}", "OK"
                 )
 
             self.root.after(0, lambda: self.stats_label.configure(
-                text=f"{total:,} candidates  •  {rate:,}/s" if total else "0 candidates (check settings)"))
+                text=f"{total:,} candidates  •  {rate:,}/s" if total else "0 candidates — check Log tab"))
             self.root.after(0, lambda: self.count_label.configure(
-                text=f"{total:,} done"))
+                text=f"{total:,} done" if total else "0 candidates"))
 
             if total > 0:
                 is_wl = bool(rules.wordlist_custom_path)
@@ -1006,7 +1229,6 @@ class PwgenGUI:
         self.progress_bar.stop()
         self.run_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        # Clean up temp seed file
         if self._seed_tmp:
             try: os.unlink(self._seed_tmp)
             except Exception: pass
@@ -1047,7 +1269,15 @@ class PwgenGUI:
         vals = self.hist_tree.item(sel[0], "values")
         path = vals[2] if len(vals) > 2 else ""
         if path and os.path.exists(path):
-            os.startfile(path)
+            try:
+                if sys.platform == "win32":
+                    os.startfile(path)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", path])
+                else:
+                    subprocess.Popen(["xdg-open", path])
+            except Exception as exc:
+                messagebox.showwarning("Cannot Open File", str(exc))
         else:
             messagebox.showwarning("File Not Found", f"Cannot open:\n{path}")
 
@@ -1074,8 +1304,7 @@ def _bg_key_for(widget: tk.Widget) -> str:
         p = getattr(w, "master", None)
         if p is None: break
         if isinstance(p, tk.LabelFrame):
-            # determine from pack/grid manager which LabelFrame this is
-            return "bg"   # default; overridden in _apply_theme inner loop
+            return "bg"
         w = p
     return "bg"
 
